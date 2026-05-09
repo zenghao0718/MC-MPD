@@ -17,6 +17,21 @@ from util.utils import load_model
 import util.logger as logger
 
 
+def build_prototypical_kwargs(args):
+    return {
+        "distance_type": args.distance_type,
+        "graph_alpha": args.graph_alpha,
+        "graph_edge_weight": args.graph_edge_weight,
+        "distance_norm": args.distance_norm,
+        "graph_mode": args.graph_mode,
+        "graph_k": args.graph_k,
+        "graph_query_k_global": args.graph_query_k_global,
+        "graph_query_min_per_class": args.graph_query_min_per_class,
+        "graph_fallback": args.graph_fallback,
+        "transductive": args.transductive,
+    }
+
+
 # no ddp setting
 def main(): 
     #################### prepare device ####################
@@ -82,7 +97,12 @@ def main():
                     outputs = model(batch_data)
                 outputs = rearrange(outputs, '(n b) l -> 1 b n l', n=args.num_class_test) # we change the subscript sequence
 
-                _, scores = compute_prototypical_loss(outputs, labels, args.num_support_test)
+                _, scores = compute_prototypical_loss(
+                    outputs,
+                    labels,
+                    args.num_support_test,
+                    **build_prototypical_kwargs(args),
+                )
 
                 prob = scores.softmax(dim=-1).cpu()
                 labels = labels.cpu()

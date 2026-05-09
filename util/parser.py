@@ -20,6 +20,28 @@ class ModelParser():
         self.parser.add_argument('--num_workers', type=int, default=8,  help='Number of workers in dataloader. ')
 
         self.parser.add_argument('--seed', type=int, default=None, help='Random seed for the main processes. ')
+
+        """ prototypical distance options """
+        self.parser.add_argument('--distance_type', type=str, default='squared_euclidean',
+                                 help='Distance type: squared_euclidean keeps original FSD; graph uses graph distance. ')
+        self.parser.add_argument('--graph_alpha', type=float, default=1.0,
+                                 help='Graph distance weight. V1 only supports 1.0. ')
+        self.parser.add_argument('--graph_edge_weight', type=str, default='squared_euclidean',
+                                 help='Graph edge weight type. V1 only supports squared_euclidean. ')
+        self.parser.add_argument('--distance_norm', type=str, default='mean',
+                                 help='Distance normalization for graph mode. V1 supports mean or none. ')
+        self.parser.add_argument('--graph_mode', type=str, default='label_aware_global',
+                                 help='Graph construction mode. V1 only supports label_aware_global. ')
+        self.parser.add_argument('--graph_k', type=int, default=3,
+                                 help='Number of same-class support neighbors for support-support edges. ')
+        self.parser.add_argument('--graph_query_k_global', type=int, default=3,
+                                 help='Number of globally nearest support nodes connected to each query. ')
+        self.parser.add_argument('--graph_query_min_per_class', type=int, default=1,
+                                 help='Minimum query-support edges kept for each class. ')
+        self.parser.add_argument('--graph_fallback', type=str, default='squared_euclidean',
+                                 help='Fallback distance when graph path is unreachable. V1 only supports squared_euclidean. ')
+        self.parser.add_argument('--transductive', type=self._str2bool, default=False,
+                                 help='Whether to put multiple queries into one graph. V1 only supports False. ')
     
     @property
     def args(self): 

@@ -22,6 +22,21 @@ from util.utils import save_model, setup_dist
 import util.logger as logger
 
 
+def build_prototypical_kwargs(args):
+    return {
+        "distance_type": args.distance_type,
+        "graph_alpha": args.graph_alpha,
+        "graph_edge_weight": args.graph_edge_weight,
+        "distance_norm": args.distance_norm,
+        "graph_mode": args.graph_mode,
+        "graph_k": args.graph_k,
+        "graph_query_k_global": args.graph_query_k_global,
+        "graph_query_min_per_class": args.graph_query_min_per_class,
+        "graph_fallback": args.graph_fallback,
+        "transductive": args.transductive,
+    }
+
+
 def main(): 
     #################### prepare ####################
     args = TrainParser().args
@@ -114,9 +129,17 @@ def main():
             outputs = model(batch_data)
         outputs = rearrange(outputs, '(n b t) l -> b t n l', n=args.num_class_train, b=args.batch_size) # we change the subscript sequence
 
-        loss, _ = compute_prototypical_loss(outputs, labels, args.num_support_train)
+        loss, _, graph_stats = compute_prototypical_loss(
+            outputs,
+            labels,
+            args.num_support_train,
+            return_stats=True,
+            **build_prototypical_kwargs(args),
+        )
 
         logger.logkv_mean("loss", loss.item())
+        for stat_name, stat_value in graph_stats.items():
+            logger.logkv_mean(f"graph/{stat_name}", stat_value)
         scaler.scale(loss / args.accumulation_steps).backward()
         
         # accumulate
@@ -142,6 +165,20 @@ def main():
             kvs = logger.dumpkvs()
             tb_writer.add_scalar("train/loss", kvs.get("loss", 0.0), step)
             tb_writer.add_scalar("train/lr", current_lr, step)
+            for stat_name in (
+                "mean_graph_distance",
+                "min_graph_distance",
+                "max_graph_distance",
+                "fallback_count",
+                "unreachable_count",
+                "mean_margin",
+                "mean_final_distance",
+                "graph_alpha",
+                "graph_k",
+            ):
+                graph_key = f"graph/{stat_name}"
+                if graph_key in kvs:
+                    tb_writer.add_scalar(graph_key, kvs[graph_key], step)
         
         # save checkpoint
         if step % args.save_interval == 0: 
@@ -189,7 +226,12 @@ def main():
                             outputs = model(batch_data)
                         outputs = rearrange(outputs, '(n b) l -> 1 b n l', n=2) # we change the subscript sequence
 
-                        _, scores = compute_prototypical_loss(outputs, labels, args.num_support_val)
+                        _, scores = compute_prototypical_loss(
+                            outputs,
+                            labels,
+                            args.num_support_val,
+                            **build_prototypical_kwargs(args),
+                        )
                         
                         prob = scores.softmax(dim=-1).cpu()
                         labels = labels.cpu()
