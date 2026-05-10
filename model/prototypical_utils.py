@@ -46,6 +46,14 @@ def _pairwise_squared_euclidean(nodes):
     return (diff ** 2).sum(dim=-1)
 
 
+def _pairwise_squared_euclidean_batched(nodes):
+    """Batched pairwise squared Euclidean distance without materializing feature diffs."""
+
+    squared_norm = (nodes ** 2).sum(dim=-1, keepdim=True)
+    distances = squared_norm + squared_norm.transpose(1, 2) - 2 * torch.bmm(nodes, nodes.transpose(1, 2))
+    return distances.clamp_min(0)
+
+
 def _connect_undirected(adj, dist_matrix, src_idx, dst_idx):
     """Connect two nodes with differentiable edge weight from dist_matrix."""
 
@@ -146,6 +154,16 @@ def floyd_warshall_torch(adj):
     return dist
 
 
+def floyd_warshall_torch_batched(adj):
+    """Batched Floyd-Warshall for many small graphs at once."""
+
+    dist = adj.clone()
+    node_num = dist.shape[-1]
+    for k in range(node_num):
+        dist = torch.minimum(dist, dist[:, :, k:k + 1] + dist[:, k:k + 1, :])
+    return dist
+
+
 def mean_normalize_distance(distances, eps=1e-12):
     """均值归一化：只缩放距离，不改变距离正负和大小顺序。"""
 
@@ -164,7 +182,7 @@ def _compute_margin(distances, labels):
     return nearest_wrong - true_distances
 
 
-def compute_graph_prototypical_scores(
+def compute_graph_prototypical_scores_loop(
     support_set,
     query_set,
     prototypes,
@@ -240,6 +258,150 @@ def compute_graph_prototypical_scores(
         "unreachable_count": float(unreachable_count),
         "mean_margin": margins.mean(),
         "mean_final_distance": final_distances.mean(),
+    }
+    return scores, stats
+
+
+def _connect_batched(adj, dist_matrix, graph_indices, src_indices, dst_indices):
+    """Connect batched graph edges in both directions."""
+
+    edge_weights = dist_matrix[graph_indices, src_indices, dst_indices]
+    adj[graph_indices, src_indices, dst_indices] = edge_weights
+    adj[graph_indices, dst_indices, src_indices] = edge_weights
+
+
+def compute_graph_prototypical_scores(
+    support_set,
+    query_set,
+    prototypes,
+    labels,
+    graph_k=3,
+    graph_query_k_global=3,
+    graph_query_min_per_class=1,
+    distance_norm="mean",
+):
+    """Compute label-aware graph distance scores with batched small-graph ops."""
+
+    if graph_k < 0 or graph_query_k_global < 0 or graph_query_min_per_class < 0:
+        raise ValueError("graph_k、graph_query_k_global、graph_query_min_per_class 不能为负数。")
+
+    batch_size, support_num, class_num, feature_dim = support_set.shape
+    query_num = query_set.shape[1]
+    query_per_episode = query_num * class_num
+    graph_num = batch_size * query_per_episode
+    device = support_set.device
+
+    support_by_class = support_set.permute(0, 2, 1, 3).float()
+    support_nodes = support_by_class.reshape(batch_size, class_num * support_num, feature_dim)
+    proto_nodes = prototypes[:, 0].float()
+    query_nodes = rearrange(query_set, 'b q c l -> b (q c) l').float()
+
+    support_total = class_num * support_num
+    proto_start = support_total
+    query_node_idx = support_total + class_num
+    node_num = query_node_idx + 1
+
+    graph_support = support_nodes[:, None, :, :].expand(batch_size, query_per_episode, support_total, feature_dim)
+    graph_proto = proto_nodes[:, None, :, :].expand(batch_size, query_per_episode, class_num, feature_dim)
+    graph_query = query_nodes[:, :, None, :]
+    nodes = torch.cat([graph_support, graph_proto, graph_query], dim=2).reshape(graph_num, node_num, feature_dim)
+
+    dist_matrix = _pairwise_squared_euclidean_batched(nodes)
+    adj = torch.full(
+        (graph_num, node_num, node_num),
+        float("inf"),
+        device=device,
+        dtype=nodes.dtype,
+    )
+    diagonal = torch.arange(node_num, device=device)
+    adj[:, diagonal, diagonal] = 0
+
+    graph_indices_1d = torch.arange(graph_num, device=device)
+
+    # 1. support-support：同类别 support 内部批量建 kNN 边。
+    support_k = min(graph_k, max(support_num - 1, 0))
+    if support_k > 0:
+        local_support_indices = torch.arange(support_num, device=device)
+        for class_idx in range(class_num):
+            start = class_idx * support_num
+            end = start + support_num
+            class_indices = torch.arange(start, end, device=device)
+            class_dist = dist_matrix[:, class_indices][:, :, class_indices].clone()
+            class_dist[:, local_support_indices, local_support_indices] = float("inf")
+            nearest = torch.topk(class_dist, k=support_k, largest=False, dim=-1).indices
+
+            graph_indices = graph_indices_1d[:, None, None].expand(graph_num, support_num, support_k)
+            src_indices = class_indices[local_support_indices][None, :, None].expand(graph_num, support_num, support_k)
+            dst_indices = class_indices[nearest]
+            _connect_batched(adj, dist_matrix, graph_indices, src_indices, dst_indices)
+
+    # 2. prototype-support：第一版连接本类全部 support，避免 prototype 孤立。
+    for class_idx in range(class_num):
+        proto_idx = proto_start + class_idx
+        for support_idx in range(support_num):
+            node_idx = class_idx * support_num + support_idx
+            _connect_batched(
+                adj,
+                dist_matrix,
+                graph_indices_1d,
+                torch.full((graph_num,), proto_idx, device=device, dtype=torch.long),
+                torch.full((graph_num,), node_idx, device=device, dtype=torch.long),
+            )
+
+    # 3. query-support：先连全局最近邻，再保证每个类别至少可达。
+    support_indices = torch.arange(support_total, device=device)
+    query_to_support = dist_matrix[:, query_node_idx, support_indices]
+    global_k = min(graph_query_k_global, support_total)
+    if global_k > 0:
+        global_nearest = torch.topk(query_to_support, k=global_k, largest=False, dim=-1).indices
+        graph_indices = graph_indices_1d[:, None].expand(graph_num, global_k)
+        src_indices = torch.full((graph_num, global_k), query_node_idx, device=device, dtype=torch.long)
+        dst_indices = support_indices[global_nearest]
+        _connect_batched(adj, dist_matrix, graph_indices, src_indices, dst_indices)
+
+    per_class_k = min(graph_query_min_per_class, support_num)
+    if per_class_k > 0:
+        for class_idx in range(class_num):
+            start = class_idx * support_num
+            end = start + support_num
+            class_indices = torch.arange(start, end, device=device)
+            class_dist = dist_matrix[:, query_node_idx, class_indices]
+            class_nearest = torch.topk(class_dist, k=per_class_k, largest=False, dim=-1).indices
+
+            graph_indices = graph_indices_1d[:, None].expand(graph_num, per_class_k)
+            src_indices = torch.full((graph_num, per_class_k), query_node_idx, device=device, dtype=torch.long)
+            dst_indices = class_indices[class_nearest]
+            _connect_batched(adj, dist_matrix, graph_indices, src_indices, dst_indices)
+
+    shortest_paths = floyd_warshall_torch_batched(adj)
+    proto_indices = torch.arange(proto_start, proto_start + class_num, device=device)
+    graph_distances = shortest_paths[:, query_node_idx, proto_indices]
+    direct_proto_distances = dist_matrix[:, query_node_idx, proto_indices]
+
+    invalid_mask = ~torch.isfinite(graph_distances)
+    invalid_num = int(invalid_mask.detach().sum().item())
+    graph_distances = torch.where(invalid_mask, direct_proto_distances, graph_distances)
+
+    raw_distances = graph_distances.reshape(batch_size, query_per_episode, class_num)
+    final_distances = raw_distances
+    if distance_norm == "mean":
+        episode_mean = final_distances.detach().reshape(batch_size, -1).mean(dim=1).clamp_min(1e-12)
+        final_distances = final_distances / episode_mean.view(batch_size, 1, 1)
+    elif distance_norm != "none":
+        raise NotImplementedError("第一版暂时只支持 distance_norm='mean' 或 'none'。")
+
+    distances_for_scores = final_distances.reshape(batch_size * query_per_episode, class_num)
+    scores = -distances_for_scores
+    margins = _compute_margin(distances_for_scores, labels).detach()
+
+    stats = {
+        "mean_graph_distance": raw_distances.detach().mean(),
+        "min_graph_distance": raw_distances.detach().min(),
+        "max_graph_distance": raw_distances.detach().max(),
+        "fallback_count": float(invalid_num),
+        "unreachable_count": float(invalid_num),
+        "mean_margin": margins.mean(),
+        "mean_final_distance": final_distances.detach().mean(),
     }
     return scores, stats
 
