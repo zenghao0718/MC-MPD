@@ -23,9 +23,9 @@ class ModelParser():
 
         """ prototypical distance options """
         self.parser.add_argument('--distance_type', type=str, default='squared_euclidean',
-                                 help='Distance type: squared_euclidean keeps original FSD; graph uses graph distance. ')
+                                 help='Distance type: squared_euclidean keeps original FSD; graph uses graph or mixed distance. ')
         self.parser.add_argument('--graph_alpha', type=float, default=1.0,
-                                 help='Graph distance weight. V1 only supports 1.0. ')
+                                 help='Graph distance weight in graph mode. 1.0 means pure graph; 0.3 means 30% graph + 70% squared Euclidean. ')
         self.parser.add_argument('--graph_edge_weight', type=str, default='squared_euclidean',
                                  help='Graph edge weight type. V1 only supports squared_euclidean. ')
         self.parser.add_argument('--distance_norm', type=str, default='mean',

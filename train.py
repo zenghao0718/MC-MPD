@@ -166,7 +166,10 @@ def main():
             tb_writer.add_scalar("train/loss", kvs.get("loss", 0.0), step)
             tb_writer.add_scalar("train/lr", current_lr, step)
             for stat_name in (
+                "mean_euclidean_distance",
+                "mean_euclidean_distance_norm",
                 "mean_graph_distance",
+                "mean_graph_distance_norm",
                 "min_graph_distance",
                 "max_graph_distance",
                 "fallback_count",

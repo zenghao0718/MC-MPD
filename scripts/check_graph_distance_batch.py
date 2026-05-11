@@ -70,6 +70,7 @@ def main():
         query_set=query_set,
         prototypes=prototypes,
         labels=labels,
+        graph_alpha=1.0,
         graph_k=3,
         graph_query_k_global=3,
         graph_query_min_per_class=1,
@@ -80,6 +81,7 @@ def main():
         query_set=query_set,
         prototypes=prototypes,
         labels=labels,
+        graph_alpha=1.0,
         graph_k=3,
         graph_query_k_global=3,
         graph_query_min_per_class=1,
@@ -87,7 +89,7 @@ def main():
     )
     graph_diff = (loop_scores - batched_scores).abs().max().item()
 
-    loss, _ = compute_prototypical_loss(
+    _, pure_graph_scores = compute_prototypical_loss(
         inputs,
         labels,
         args.support_num,
@@ -102,19 +104,53 @@ def main():
         graph_fallback="squared_euclidean",
         transductive=False,
     )
-    loss.backward()
-    grad_ok = inputs.grad is not None and torch.isfinite(inputs.grad).all().item()
+    pure_graph_diff = (pure_graph_scores - batched_scores).abs().max().item()
+
+    mixed_inputs = inputs.detach().clone().requires_grad_(True)
+    mixed_loss, mixed_scores, mixed_stats = compute_prototypical_loss(
+        mixed_inputs,
+        labels,
+        args.support_num,
+        distance_type="graph",
+        graph_alpha=0.3,
+        graph_edge_weight="squared_euclidean",
+        distance_norm="mean",
+        graph_mode="label_aware_global",
+        graph_k=3,
+        graph_query_k_global=3,
+        graph_query_min_per_class=1,
+        graph_fallback="squared_euclidean",
+        transductive=False,
+        return_stats=True,
+    )
+    mixed_loss.backward()
+    grad_ok = mixed_inputs.grad is not None and torch.isfinite(mixed_inputs.grad).all().item()
+    mixed_shape_ok = mixed_scores.shape == original_scores.shape
+    mixed_stats_ok = all(
+        torch.isfinite(value).all().item()
+        for value in mixed_stats.values()
+        if torch.is_tensor(value)
+    )
 
     print(f"baseline max diff: {baseline_diff:.8g}")
     print(f"loop vs batched graph max diff: {graph_diff:.8g}")
-    print(f"graph backward finite: {grad_ok}")
+    print(f"pure graph alpha=1 max diff: {pure_graph_diff:.8g}")
+    print(f"mixed alpha=0.3 scores shape ok: {mixed_shape_ok}")
+    print(f"mixed alpha=0.3 stats finite: {mixed_stats_ok}")
+    print(f"mixed alpha=0.3 backward finite: {grad_ok}")
 
     if baseline_diff > args.tolerance:
         raise SystemExit(f"Baseline mismatch: {baseline_diff} > {args.tolerance}")
     if graph_diff > args.tolerance:
         raise SystemExit(f"Graph implementation mismatch: {graph_diff} > {args.tolerance}")
+    if pure_graph_diff > args.tolerance:
+        raise SystemExit(f"Pure graph alpha=1 mismatch: {pure_graph_diff} > {args.tolerance}")
+    if not mixed_shape_ok:
+        raise SystemExit("Mixed graph scores shape mismatch.")
+    if not mixed_stats_ok:
+        raise SystemExit("Mixed graph stats contain NaN or Inf.")
     if not grad_ok:
-        raise SystemExit("Graph backward failed or produced non-finite gradients.")
+        raise SystemExit("Mixed graph backward failed or produced non-finite gradients.")
 
 
 if __name__ == "__main__":

@@ -35,8 +35,8 @@ def _validate_graph_options(
         raise NotImplementedError("第一版暂时只支持 graph_fallback='squared_euclidean'。")
     if distance_norm not in ("mean", "none"):
         raise NotImplementedError("第一版暂时只支持 distance_norm='mean' 或 'none'。")
-    if abs(float(graph_alpha) - 1.0) > 1e-12:
-        raise NotImplementedError("第一版暂时只支持 graph_alpha=1.0，不做欧氏距离和图距离混合。")
+    if not 0.0 <= float(graph_alpha) <= 1.0:
+        raise ValueError("graph_alpha 必须在 0.0 到 1.0 之间。")
 
 
 def _pairwise_squared_euclidean(nodes):
@@ -187,6 +187,7 @@ def compute_graph_prototypical_scores_loop(
     query_set,
     prototypes,
     labels,
+    graph_alpha=1.0,
     graph_k=3,
     graph_query_k_global=3,
     graph_query_min_per_class=1,
@@ -196,9 +197,15 @@ def compute_graph_prototypical_scores_loop(
 
     batch_size, _, class_num, _ = support_set.shape
     query_num = query_set.shape[1]
+    graph_alpha = float(graph_alpha)
+    if not 0.0 <= graph_alpha <= 1.0:
+        raise ValueError("graph_alpha 必须在 0.0 到 1.0 之间。")
 
     batch_scores = []
     raw_distance_values = []
+    raw_euclidean_values = []
+    graph_norm_values = []
+    euclidean_norm_values = []
     final_distance_values = []
     unreachable_count = 0
     fallback_count = 0
@@ -208,6 +215,7 @@ def compute_graph_prototypical_scores_loop(
         proto_by_class = prototypes[batch_idx, 0].float()
         episode_distances = []
         episode_raw_distances = []
+        episode_euclidean_distances = []
 
         for query_idx in range(query_num):
             for query_class_idx in range(class_num):
@@ -230,28 +238,47 @@ def compute_graph_prototypical_scores_loop(
                 graph_distances = torch.where(invalid_mask, direct_proto_distances, graph_distances)
 
                 episode_raw_distances.append(graph_distances)
-                episode_distances.append(graph_distances)
+                episode_euclidean_distances.append(direct_proto_distances)
 
         episode_raw_distances = torch.stack(episode_raw_distances, dim=0)
-        episode_distances = torch.stack(episode_distances, dim=0)
+        episode_euclidean_distances = torch.stack(episode_euclidean_distances, dim=0)
         raw_distance_values.append(episode_raw_distances.detach().reshape(-1))
+        raw_euclidean_values.append(episode_euclidean_distances.detach().reshape(-1))
 
         if distance_norm == "mean":
-            episode_distances = mean_normalize_distance(episode_distances)
+            episode_graph_distances = mean_normalize_distance(episode_raw_distances)
+            episode_euclidean_distances = mean_normalize_distance(episode_euclidean_distances)
         elif distance_norm != "none":
             raise NotImplementedError("第一版暂时只支持 distance_norm='mean' 或 'none'。")
 
+        if distance_norm == "none":
+            episode_graph_distances = episode_raw_distances
+
+        # 混合距离：保留原始平方欧氏距离，同时让图距离作为可调辅助。
+        episode_distances = (
+            (1.0 - graph_alpha) * episode_euclidean_distances
+            + graph_alpha * episode_graph_distances
+        )
+
+        graph_norm_values.append(episode_graph_distances.detach().reshape(-1))
+        euclidean_norm_values.append(episode_euclidean_distances.detach().reshape(-1))
         final_distance_values.append(episode_distances.detach().reshape(-1))
         batch_scores.append(-episode_distances)
 
     distances_for_scores = torch.cat([(-scores) for scores in batch_scores], dim=0)
     scores = torch.cat(batch_scores, dim=0)
     raw_distances = torch.cat(raw_distance_values, dim=0)
+    raw_euclidean_distances = torch.cat(raw_euclidean_values, dim=0)
+    graph_norm_distances = torch.cat(graph_norm_values, dim=0)
+    euclidean_norm_distances = torch.cat(euclidean_norm_values, dim=0)
     final_distances = torch.cat(final_distance_values, dim=0)
     margins = _compute_margin(distances_for_scores, labels).detach()
 
     stats = {
+        "mean_euclidean_distance": raw_euclidean_distances.mean(),
+        "mean_euclidean_distance_norm": euclidean_norm_distances.mean(),
         "mean_graph_distance": raw_distances.mean(),
+        "mean_graph_distance_norm": graph_norm_distances.mean(),
         "min_graph_distance": raw_distances.min(),
         "max_graph_distance": raw_distances.max(),
         "fallback_count": float(fallback_count),
@@ -275,6 +302,7 @@ def compute_graph_prototypical_scores(
     query_set,
     prototypes,
     labels,
+    graph_alpha=1.0,
     graph_k=3,
     graph_query_k_global=3,
     graph_query_min_per_class=1,
@@ -285,6 +313,9 @@ def compute_graph_prototypical_scores(
     if graph_k < 0 or graph_query_k_global < 0 or graph_query_min_per_class < 0:
         raise ValueError("graph_k、graph_query_k_global、graph_query_min_per_class 不能为负数。")
 
+    graph_alpha = float(graph_alpha)
+    if not 0.0 <= graph_alpha <= 1.0:
+        raise ValueError("graph_alpha 必须在 0.0 到 1.0 之间。")
     batch_size, support_num, class_num, feature_dim = support_set.shape
     query_num = query_set.shape[1]
     query_per_episode = query_num * class_num
@@ -383,19 +414,34 @@ def compute_graph_prototypical_scores(
     graph_distances = torch.where(invalid_mask, direct_proto_distances, graph_distances)
 
     raw_distances = graph_distances.reshape(batch_size, query_per_episode, class_num)
-    final_distances = raw_distances
+    euclidean_distances = direct_proto_distances.reshape(batch_size, query_per_episode, class_num)
     if distance_norm == "mean":
-        episode_mean = final_distances.detach().reshape(batch_size, -1).mean(dim=1).clamp_min(1e-12)
-        final_distances = final_distances / episode_mean.view(batch_size, 1, 1)
+        graph_episode_mean = raw_distances.detach().reshape(batch_size, -1).mean(dim=1).clamp_min(1e-12)
+        euclidean_episode_mean = euclidean_distances.detach().reshape(batch_size, -1).mean(dim=1).clamp_min(1e-12)
+        graph_distances_norm = raw_distances / graph_episode_mean.view(batch_size, 1, 1)
+        euclidean_distances_norm = euclidean_distances / euclidean_episode_mean.view(batch_size, 1, 1)
     elif distance_norm != "none":
         raise NotImplementedError("第一版暂时只支持 distance_norm='mean' 或 'none'。")
+
+    if distance_norm == "none":
+        graph_distances_norm = raw_distances
+        euclidean_distances_norm = euclidean_distances
+
+    # 混合距离：graph_alpha=1.0 保持纯图距离；小于 1 时保留部分原始平方欧氏距离。
+    final_distances = (
+        (1.0 - graph_alpha) * euclidean_distances_norm
+        + graph_alpha * graph_distances_norm
+    )
 
     distances_for_scores = final_distances.reshape(batch_size * query_per_episode, class_num)
     scores = -distances_for_scores
     margins = _compute_margin(distances_for_scores, labels).detach()
 
     stats = {
+        "mean_euclidean_distance": euclidean_distances.detach().mean(),
+        "mean_euclidean_distance_norm": euclidean_distances_norm.detach().mean(),
         "mean_graph_distance": raw_distances.detach().mean(),
+        "mean_graph_distance_norm": graph_distances_norm.detach().mean(),
         "min_graph_distance": raw_distances.detach().min(),
         "max_graph_distance": raw_distances.detach().max(),
         "fallback_count": float(invalid_num),
@@ -456,6 +502,7 @@ def compute_prototypical_loss(
             query_set=query_set,
             prototypes=prototypes,
             labels=labels,
+            graph_alpha=graph_alpha,
             graph_k=graph_k,
             graph_query_k_global=graph_query_k_global,
             graph_query_min_per_class=graph_query_min_per_class,
