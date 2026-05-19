@@ -15,16 +15,75 @@ from torchmetrics.classification import Accuracy, AveragePrecision
 
 from torch.utils.tensorboard import SummaryWriter
 
-from model.prototypical_utils import compute_prototypical_loss
+from model.dual_branch_fsd import DualBranchFSD
+from model.prototypical_utils import compute_dual_branch_logits_and_losses, compute_prototypical_loss
 from datasets import setup_infinity_train_dataloader, setup_val_dataloader
+from util.frequency import haar_dwt_highfreq_rgb_mean, load_dwt_stats
 from util.parser import TrainParser
 from util.utils import save_model, setup_dist
 import util.logger as logger
 
 
+def validate_dual_branch_args(args):
+    if not args.use_dual_branch:
+        return
+    if args.freq_input_type != "dwt":
+        raise NotImplementedError("First DWT dual-branch version only implements freq_input_type='dwt'.")
+    if args.reliability_norm_mode != "episode_mean":
+        raise NotImplementedError("First DWT dual-branch version only supports reliability_norm_mode='episode_mean'.")
+
+
+def build_frequency_batch(batch_data, args, freq_mean, freq_std):
+    return haar_dwt_highfreq_rgb_mean(
+        batch_data,
+        use_abs=args.dwt_use_abs,
+        use_log1p=args.dwt_use_log1p,
+        resize_to=224,
+        mean=freq_mean,
+        std=freq_std,
+        input_scale=args.dwt_input_scale,
+        eps=args.freq_norm_eps,
+    )
+
+
+def log_dual_branch_scalars(tb_writer, step, loss_dict, logit_dict, debug_dict, labels):
+    with torch.no_grad():
+        dist_rgb_mean = debug_dict["dist_rgb"].detach().float().mean()
+        dist_freq_mean = debug_dict["dist_freq"].detach().float().mean()
+        dist_ratio = dist_rgb_mean / dist_freq_mean.clamp_min(1e-12)
+        labels = labels.detach()
+        scalars = {
+            "loss/total": loss_dict["loss"],
+            "loss/dual": loss_dict["loss_dual"],
+            "loss/rgb": loss_dict["loss_rgb"],
+            "loss/freq": loss_dict["loss_freq"],
+            "acc/dual": (logit_dict["logits_dual"].detach().argmax(dim=-1) == labels).float().mean(),
+            "acc/rgb": (logit_dict["logits_rgb"].detach().argmax(dim=-1) == labels).float().mean(),
+            "acc/freq": (logit_dict["logits_freq"].detach().argmax(dim=-1) == labels).float().mean(),
+            "alpha/rgb_mean": debug_dict["alpha_rgb"].detach().float().mean(),
+            "alpha/rgb_std": debug_dict["alpha_rgb"].detach().float().std(unbiased=False),
+            "alpha/rgb_min": debug_dict["alpha_rgb"].detach().float().min(),
+            "alpha/rgb_max": debug_dict["alpha_rgb"].detach().float().max(),
+            "alpha/freq_mean": debug_dict["alpha_freq"].detach().float().mean(),
+            "alpha/freq_std": debug_dict["alpha_freq"].detach().float().std(unbiased=False),
+            "alpha/freq_min": debug_dict["alpha_freq"].detach().float().min(),
+            "alpha/freq_max": debug_dict["alpha_freq"].detach().float().max(),
+            "dist/rgb_mean": dist_rgb_mean,
+            "dist/freq_mean": dist_freq_mean,
+            "dist/ratio_mean": dist_ratio,
+            "variance/rgb_mean": debug_dict["var_rgb"].detach().float().mean(),
+            "variance/freq_mean": debug_dict["var_freq"].detach().float().mean(),
+            "variance_norm/rgb_mean": debug_dict["var_rgb_norm"].detach().float().mean(),
+            "variance_norm/freq_mean": debug_dict["var_freq_norm"].detach().float().mean(),
+        }
+        for name, value in scalars.items():
+            tb_writer.add_scalar(name, float(value.detach().cpu()), step)
+
+
 def main(): 
     #################### prepare ####################
     args = TrainParser().args
+    validate_dual_branch_args(args)
     setup_dist(args) # ddp setup
 
     # terminal writer and file writer
@@ -63,8 +122,15 @@ def main():
 
     
     ################## create model #################
-    logger.info("Creating model 'resnet50'... ")
-    model = timm.create_model("resnet50", pretrained=True, num_classes=1024)
+    freq_mean = None
+    freq_std = None
+    if args.use_dual_branch:
+        logger.info("Creating DWT dual-branch model 'resnet50 + resnet50'... ")
+        freq_mean, freq_std = load_dwt_stats(args.freq_stats_path, device=args.device, dtype=torch.float32)
+        model = DualBranchFSD()
+    else:
+        logger.info("Creating model 'resnet50'... ")
+        model = timm.create_model("resnet50", pretrained=True, num_classes=1024)
     print(model)
 
     model = model.to(args.device)
@@ -110,13 +176,55 @@ def main():
         labels = torch.arange(0, args.num_class_train, device=args.device).repeat(args.batch_size * args.num_query_train)
 
         batch_data = rearrange(batch_data, 'n b c h w -> (n b) c h w')
-        with autocast(enabled=args.use_fp16, device_type="cuda"):
-            outputs = model(batch_data)
-        outputs = rearrange(outputs, '(n b t) l -> b t n l', n=args.num_class_train, b=args.batch_size) # we change the subscript sequence
+        if args.use_dual_branch:
+            batch_rgb = batch_data
+            batch_freq = build_frequency_batch(batch_data, args, freq_mean, freq_std)
+            with autocast(enabled=args.use_fp16, device_type="cuda"):
+                outputs_rgb, outputs_freq = model(batch_rgb, batch_freq)
+                outputs_rgb = rearrange(
+                    outputs_rgb,
+                    '(n b t) l -> b t n l',
+                    n=args.num_class_train,
+                    b=args.batch_size,
+                )
+                outputs_freq = rearrange(
+                    outputs_freq,
+                    '(n b t) l -> b t n l',
+                    n=args.num_class_train,
+                    b=args.batch_size,
+                )
+                loss_dict, logit_dict, debug_dict = compute_dual_branch_logits_and_losses(
+                    outputs_rgb,
+                    outputs_freq,
+                    labels,
+                    args.num_support_train,
+                    use_aux_loss=args.use_aux_loss,
+                    lambda_rgb=args.lambda_rgb,
+                    lambda_freq=args.lambda_freq,
+                    normalize_reliability_variance=args.normalize_reliability_variance,
+                    reliability_norm_mode=args.reliability_norm_mode,
+                    reliability_temperature=args.reliability_temperature,
+                    detach_reliability=args.detach_reliability,
+                    clip_reliability_weight=args.clip_reliability_weight,
+                    alpha_min=args.alpha_min,
+                    alpha_max=args.alpha_max,
+                    reliability_eps=args.reliability_eps,
+                )
+                loss = loss_dict["loss"]
+        else:
+            with autocast(enabled=args.use_fp16, device_type="cuda"):
+                outputs = model(batch_data)
+            outputs = rearrange(outputs, '(n b t) l -> b t n l', n=args.num_class_train, b=args.batch_size) # we change the subscript sequence
 
-        loss, _ = compute_prototypical_loss(outputs, labels, args.num_support_train)
+            loss, _ = compute_prototypical_loss(outputs, labels, args.num_support_train)
 
         logger.logkv_mean("loss", loss.item())
+        if args.use_dual_branch:
+            logger.logkv_mean("loss_dual", loss_dict["loss_dual"].item())
+            logger.logkv_mean("loss_rgb", loss_dict["loss_rgb"].item())
+            logger.logkv_mean("loss_freq", loss_dict["loss_freq"].item())
+            if step % args.tb_log_interval == 0:
+                log_dual_branch_scalars(tb_writer, step, loss_dict, logit_dict, debug_dict, labels)
         scaler.scale(loss / args.accumulation_steps).backward()
         
         # accumulate
@@ -156,6 +264,9 @@ def main():
                 'scaler': scaler, 
                 'args': args
             }
+            if args.use_dual_branch:
+                kwargs["freq_mean"] = freq_mean.detach().cpu()
+                kwargs["freq_std"] = freq_std.detach().cpu()
 
             save_model(os.path.join(args.output_dir, "ckpt"), args.model, **kwargs)
             torch.cuda.empty_cache()
@@ -182,14 +293,40 @@ def main():
                         batch_data = torch.stack([real_batch, fake_batch], dim=0) # (2, task_size, c, h, w)
                         batch_data = batch_data.to(args.device)
 
-                        batch_data = rearrange(batch_data, 'n b c h w -> (n b) c h w')
                         labels = torch.arange(0, 2, device=args.device).repeat(args.num_query_val)
 
-                        with autocast(enabled=args.use_fp16, device_type="cuda"):
-                            outputs = model(batch_data)
-                        outputs = rearrange(outputs, '(n b) l -> 1 b n l', n=2) # we change the subscript sequence
+                        batch_data = rearrange(batch_data, 'n b c h w -> (n b) c h w')
+                        if args.use_dual_branch:
+                            batch_rgb = batch_data
+                            batch_freq = build_frequency_batch(batch_data, args, freq_mean, freq_std)
+                            with autocast(enabled=args.use_fp16, device_type="cuda"):
+                                outputs_rgb, outputs_freq = model(batch_rgb, batch_freq)
+                                outputs_rgb = rearrange(outputs_rgb, '(n b) l -> 1 b n l', n=2)
+                                outputs_freq = rearrange(outputs_freq, '(n b) l -> 1 b n l', n=2)
+                                _, logit_dict, _ = compute_dual_branch_logits_and_losses(
+                                    outputs_rgb,
+                                    outputs_freq,
+                                    labels,
+                                    args.num_support_val,
+                                    use_aux_loss=args.use_aux_loss,
+                                    lambda_rgb=args.lambda_rgb,
+                                    lambda_freq=args.lambda_freq,
+                                    normalize_reliability_variance=args.normalize_reliability_variance,
+                                    reliability_norm_mode=args.reliability_norm_mode,
+                                    reliability_temperature=args.reliability_temperature,
+                                    detach_reliability=args.detach_reliability,
+                                    clip_reliability_weight=args.clip_reliability_weight,
+                                    alpha_min=args.alpha_min,
+                                    alpha_max=args.alpha_max,
+                                    reliability_eps=args.reliability_eps,
+                                )
+                                scores = logit_dict["logits_dual"]
+                        else:
+                            with autocast(enabled=args.use_fp16, device_type="cuda"):
+                                outputs = model(batch_data)
+                            outputs = rearrange(outputs, '(n b) l -> 1 b n l', n=2) # we change the subscript sequence
 
-                        _, scores = compute_prototypical_loss(outputs, labels, args.num_support_val)
+                            _, scores = compute_prototypical_loss(outputs, labels, args.num_support_val)
                         
                         prob = scores.softmax(dim=-1).cpu()
                         labels = labels.cpu()

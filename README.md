@@ -60,6 +60,29 @@ bash scripts/train.sh
 
 This script enables training with 4 GPUs, you can specify the number of GPUs by setting `GPU_NUM`.
 
+### DWT dual-branch experiment
+
+The DWT dual-branch path is disabled by default. Before enabling it, compute
+train-split frequency statistics on the target dataset:
+
+```
+python tools/compute_dwt_stats.py \
+    --data_root /root/autodl-tmp/data \
+    --exclude_class ADM \
+    --output /root/autodl-tmp/dwt_stats/exclude_ADM_freq_stats.json
+```
+
+Then add these options to the usual training/evaluation command:
+
+```
+--use_dual_branch \
+--freq_input_type dwt \
+--freq_stats_path /root/autodl-tmp/dwt_stats/exclude_ADM_freq_stats.json
+```
+
+The RGB branch keeps the original baseline `ToTensor()` input. DWT is computed
+from the same tensor before the model forward pass.
+
 ## Inference
 
 ```

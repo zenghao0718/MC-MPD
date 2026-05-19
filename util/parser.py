@@ -20,6 +20,38 @@ class ModelParser():
         self.parser.add_argument('--num_workers', type=int, default=8,  help='Number of workers in dataloader. ')
 
         self.parser.add_argument('--seed', type=int, default=None, help='Random seed for the main processes. ')
+
+        """ DWT dual-branch options """
+        self._add_bool_argument('--use_dual_branch', default=False, help='Enable DWT dual-branch FSD. ')
+        self.parser.add_argument('--freq_input_type', type=str, default='dwt', choices=('dwt', 'rgb'),
+                                 help='Frequency branch input type. V1 implements dwt only; rgb is reserved. ')
+        self.parser.add_argument('--freq_stats_path', type=str, default=None,
+                                 help='Path to train-set DWT mean/std JSON. Required for freq_input_type=dwt. ')
+        self.parser.add_argument('--dwt_input_scale', type=float, default=1.0,
+                                 help='Scale raw ToTensor input before DWT. Default keeps [0, 1] scale. ')
+        self._add_bool_argument('--dwt_use_abs', default=True, help='Use absolute DWT high-frequency coefficients. ')
+        self._add_bool_argument('--dwt_use_log1p', default=True, help='Apply log1p to DWT high-frequency tensor. ')
+        self.parser.add_argument('--freq_norm_eps', type=float, default=1e-8,
+                                 help='Epsilon for DWT frequency mean/std normalization. ')
+        self._add_bool_argument('--use_aux_loss', default=True, help='Use RGB and frequency auxiliary losses. ')
+        self.parser.add_argument('--lambda_rgb', type=float, default=0.2, help='RGB auxiliary loss weight. ')
+        self.parser.add_argument('--lambda_freq', type=float, default=0.2, help='Frequency auxiliary loss weight. ')
+        self._add_bool_argument('--normalize_reliability_variance', default=True,
+                                help='Normalize support variance before reliability softmax. ')
+        self.parser.add_argument('--reliability_norm_mode', type=str, default='episode_mean',
+                                 help='Reliability variance normalization mode. V1 supports episode_mean only. ')
+        self.parser.add_argument('--reliability_temperature', type=float, default=1.0,
+                                 help='Fixed softmax temperature for reliability fusion. ')
+        self.parser.add_argument('--reliability_eps', type=float, default=1e-8,
+                                 help='Epsilon for reliability variance normalization. ')
+        self._add_bool_argument('--detach_reliability', default=True,
+                                help='Detach reliability weights alpha from the gradient graph. ')
+        self._add_bool_argument('--clip_reliability_weight', default=True,
+                                help='Clip alpha_rgb and set alpha_freq to 1 - alpha_rgb. ')
+        self.parser.add_argument('--alpha_min', type=float, default=0.1, help='Minimum alpha_rgb when clipping. ')
+        self.parser.add_argument('--alpha_max', type=float, default=0.9, help='Maximum alpha_rgb when clipping. ')
+        self.parser.add_argument('--tb_log_interval', type=int, default=20,
+                                 help='TensorBoard interval for dual-branch debug scalars. ')
     
     @property
     def args(self): 
@@ -33,6 +65,14 @@ class ModelParser():
             return False
         else: 
             raise argparse.ArgumentTypeError('Unsupported value encountered. ')
+
+    def _add_bool_argument(self, name, default=False, help=None):
+        self.parser.add_argument(
+            name,
+            default=default,
+            action=argparse.BooleanOptionalAction,
+            help=help,
+        )
 
 
 class TrainParser(ModelParser): 

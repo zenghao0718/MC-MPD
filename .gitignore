@@ -175,6 +175,7 @@ cython_debug/
 
 # large data / outputs
 data/
+output_dir/
 runs/
 tf-logs/
 checkpoints/
