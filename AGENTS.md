@@ -351,7 +351,40 @@ AutoDL 常用命令：
 
 ---
 
-## 11. 完成任务后的汇报格式
+## 11. 实验输出与结果记录规则
+
+所有实验输出统一放在 AutoDL 的 `/root/autodl-tmp/runs/` 下，不放进 Git，也不要放在项目根目录。
+
+路径格式沿用已有实验结果的组织方式：
+
+- 原论文或 baseline 复现结果放在 `/root/autodl-tmp/runs/baseline_fsd_paper/exclude_ADM` 这类目录下。
+- 实验分支结果放在 `/root/autodl-tmp/runs/<分支名>/<实验配置名>/exclude_<类别>` 这类目录下。
+- 多类别 leave-one-out 任务中，每个类别继续使用 `exclude_ADM`、`exclude_BigGAN`、`exclude_glide`、`exclude_Midjourney`、`exclude_SD`、`exclude_VQDM`。
+
+每次训练任务都必须启用 TensorBoard。若脚本支持 `USE_TENSORBOARD`，默认保持 `USE_TENSORBOARD=True`，不要随意关闭。
+
+每次任务启动 TensorBoard 后，必须给出用户可以直接打开并复制的网址。
+
+- TensorBoard 标准启动命令为：`tensorboard --logdir <本次任务tb目录或总目录> --host 0.0.0.0 --port 6006`。
+- 如果 AutoDL 或 Cursor 提供端口转发链接，必须把实际可打开的链接写出来。
+- 如果暂时拿不到链接，必须明确告诉用户去 AutoDL 端口转发或服务列表复制 `6006` 的访问地址，不能只说“打开 TensorBoard”。
+
+每次任务结束后，都必须整理一张结果对比表，比较：
+
+- 原论文报告数据
+- 当前复现 baseline 数据
+- 当前实验数据
+
+对比表放在本次任务对应的 `runs/` 目录下，例如：
+
+- `/root/autodl-tmp/runs/<任务目录>/paper_vs_reproduce_comparison.md`
+- 如需要机器可读格式，同时保存 `/root/autodl-tmp/runs/<任务目录>/paper_vs_reproduce_comparison.csv`
+
+对比表至少包含：方法/分支、训练设置、测试类别、Accuracy、AP、checkpoint、日志目录、备注。
+
+---
+
+## 12. 完成任务后的汇报格式
 
 每次完成代码修改后，请按下面格式汇报：
 
