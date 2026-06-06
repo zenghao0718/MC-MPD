@@ -38,6 +38,12 @@ ACCUM_STEPS=${ACCUM_STEPS:-1}
 SAVE_INTERVAL=${SAVE_INTERVAL:-2500}
 EVAL_INTERVAL=${EVAL_INTERVAL:-2500}
 LOG_INTERVAL=${LOG_INTERVAL:-200}
+METRIC=${METRIC:-squared_euclidean}
+INIT_SCALE=${INIT_SCALE:-10.0}
+MAX_SCALE=${MAX_SCALE:-100.0}
+SCALE_EPS=${SCALE_EPS:-1e-12}
+USE_TENSORBOARD=${USE_TENSORBOARD:-True}
+TB_LOG_INTERVAL=${TB_LOG_INTERVAL:-20}
 
 mkdir -p "$OUTPUT_PATH"
 
@@ -62,4 +68,10 @@ OMP_NUM_THREADS=1 torchrun $DISTRIBUTED_ARGS train.py \
     --num_class_val 2 \
     --num_support_val 5 \
     --num_query_val 15 \
-    --use_fp16 True
+    --use_fp16 True \
+    --metric "$METRIC" \
+    --init_scale $INIT_SCALE \
+    --max_scale $MAX_SCALE \
+    --scale_eps $SCALE_EPS \
+    --use_tensorboard $USE_TENSORBOARD \
+    --tb_log_interval $TB_LOG_INTERVAL

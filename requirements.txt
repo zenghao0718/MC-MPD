@@ -7,3 +7,4 @@ dill
 tqdm
 scikit-learn
 matplotlib
+tensorboard

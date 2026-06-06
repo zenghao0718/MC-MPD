@@ -10,7 +10,11 @@ import timm
 from einops import rearrange
 from torchmetrics.classification import Accuracy, AveragePrecision
 
-from model.prototypical_utils import compute_prototypical_loss
+from model.cosine_metric_fsd import CosineMetricFSD
+from model.prototypical_utils import (
+    compute_prototypical_loss,
+    compute_cosine_prototypical_loss,
+)
 from datasets import setup_val_dataloader
 from util.parser import TestParser
 from util.utils import load_model
@@ -47,8 +51,19 @@ def main():
 
     
     #################### setup model ####################
-    logger.info("Creating model 'resnet50'... ")
-    model = timm.create_model("resnet50", pretrained=True, num_classes=1024)
+    if args.metric == "cosine":
+        logger.info("Creating CosineMetricFSD for testing... ")
+        model = CosineMetricFSD(
+            pretrained=False,
+            embedding_dim=1024,
+            init_scale=args.init_scale,
+            max_scale=args.max_scale,
+        )
+    elif args.metric == "squared_euclidean":
+        logger.info("Creating baseline ResNet50 for testing... ")
+        model = timm.create_model("resnet50", pretrained=False, num_classes=1024)
+    else:
+        raise ValueError(f"Unsupported metric: {args.metric}")
     load_model(args.ckpt_path, model=model)
 
     # deployment
@@ -82,7 +97,17 @@ def main():
                     outputs = model(batch_data)
                 outputs = rearrange(outputs, '(n b) l -> 1 b n l', n=args.num_class_test) # we change the subscript sequence
 
-                _, scores = compute_prototypical_loss(outputs, labels, args.num_support_test)
+                if args.metric == "cosine":
+                    scale = model.get_scale()
+                    _, scores, _ = compute_cosine_prototypical_loss(
+                        outputs,
+                        labels,
+                        args.num_support_test,
+                        scale=scale,
+                        eps=args.scale_eps,
+                    )
+                else:
+                    _, scores = compute_prototypical_loss(outputs, labels, args.num_support_test)
 
                 prob = scores.softmax(dim=-1).cpu()
                 labels = labels.cpu()

@@ -14,6 +14,31 @@ class ModelParser():
         """ base options """
         self.parser.add_argument('--model', type=str, default='resnet50', help='Name of model. ')
         self.parser.add_argument('--output_dir', type=str, default='./output_dir', help='The directory for saving checkpoints and logs. ')
+        self.parser.add_argument(
+            '--metric',
+            type=str,
+            default='squared_euclidean',
+            choices=['squared_euclidean', 'cosine'],
+            help='Prototype metric: original squared Euclidean or L2-normalized cosine. ',
+        )
+        self.parser.add_argument(
+            '--init_scale',
+            type=float,
+            default=10.0,
+            help='Initial positive scale for cosine logits. Equivalent to temperature=1/init_scale. ',
+        )
+        self.parser.add_argument(
+            '--max_scale',
+            type=float,
+            default=100.0,
+            help='Maximum positive scale after exp(log_scale). ',
+        )
+        self.parser.add_argument(
+            '--scale_eps',
+            type=float,
+            default=1e-12,
+            help='Epsilon for L2 normalization and safe reciprocal logging. ',
+        )
         
         """ dataloader options """
         self.parser.add_argument('--data_root', type=str, default='./data', help='Root of dataset. ')
@@ -61,6 +86,8 @@ class TrainParser(ModelParser):
         self.parser.add_argument('--save_interval', type=int, default=5000, help='Interval between saving model weights. ')
         self.parser.add_argument('--log_interval', type=int, default=500, help='Interval between logs. ')
         self.parser.add_argument('--eval_interval', type=int, default=5000, help='Interval between logs. ')
+        self.parser.add_argument('--use_tensorboard', type=self._str2bool, default=False, help='Whether to write TensorBoard logs. ')
+        self.parser.add_argument('--tb_log_interval', type=int, default=20, help='Interval for TensorBoard metric logging. ')
 
         # add other options if you want
 

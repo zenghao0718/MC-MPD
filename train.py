@@ -13,9 +13,11 @@ import timm
 from einops import rearrange
 from torchmetrics.classification import Accuracy, AveragePrecision
 
-from torch.utils.tensorboard import SummaryWriter
-
-from model.prototypical_utils import compute_prototypical_loss
+from model.cosine_metric_fsd import CosineMetricFSD
+from model.prototypical_utils import (
+    compute_prototypical_loss,
+    compute_cosine_prototypical_loss,
+)
 from datasets import setup_infinity_train_dataloader, setup_val_dataloader
 from util.parser import TrainParser
 from util.utils import save_model, setup_dist
@@ -30,8 +32,18 @@ def main():
     # terminal writer and file writer
     logger.setup(log_dir=args.output_dir, device=args.device)
 
-    # TensorBoard writer (only on main process)
-    tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tb"))
+    tb_writer = None
+    if args.use_tensorboard and args.rank == 0:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "TensorBoard logging was requested, but the 'tensorboard' package is not installed. "
+                "Please install it with `pip install tensorboard`, add `tensorboard` to requirements.txt, "
+                "or rerun with `--use_tensorboard False`."
+            ) from exc
+
+        tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tb"))
     #################################################
 
     
@@ -63,8 +75,19 @@ def main():
 
     
     ################## create model #################
-    logger.info("Creating model 'resnet50'... ")
-    model = timm.create_model("resnet50", pretrained=True, num_classes=1024)
+    if args.metric == "cosine":
+        logger.info("Creating CosineMetricFSD with learnable log_scale... ")
+        model = CosineMetricFSD(
+            pretrained=True,
+            embedding_dim=1024,
+            init_scale=args.init_scale,
+            max_scale=args.max_scale,
+        )
+    elif args.metric == "squared_euclidean":
+        logger.info("Creating model 'resnet50' with squared Euclidean metric... ")
+        model = timm.create_model("resnet50", pretrained=True, num_classes=1024)
+    else:
+        raise ValueError(f"Unsupported metric: {args.metric}")
     print(model)
 
     model = model.to(args.device)
@@ -114,9 +137,70 @@ def main():
             outputs = model(batch_data)
         outputs = rearrange(outputs, '(n b t) l -> b t n l', n=args.num_class_train, b=args.batch_size) # we change the subscript sequence
 
-        loss, _ = compute_prototypical_loss(outputs, labels, args.num_support_train)
+        if args.metric == "cosine":
+            scale = model.get_scale()
+            loss, scores, metric_debug = compute_cosine_prototypical_loss(
+                outputs,
+                labels,
+                args.num_support_train,
+                scale=scale,
+                eps=args.scale_eps,
+            )
+        else:
+            loss, scores = compute_prototypical_loss(outputs, labels, args.num_support_train)
+            metric_debug = None
 
         logger.logkv_mean("loss", loss.item())
+        if args.metric == "cosine":
+            with torch.no_grad():
+                scale_for_log = model.get_scale().detach().float()
+                logger.logkv_mean("metric_scale", float(scale_for_log.cpu()))
+                logger.logkv_mean("metric_log_scale", float(model.log_scale.detach().float().cpu()))
+                logger.logkv_mean(
+                    "metric_temperature",
+                    float((1.0 / scale_for_log.clamp_min(args.scale_eps)).cpu()),
+                )
+                logger.logkv_mean("metric_cosine_mean", float(metric_debug["cosine_mean"].cpu()))
+                logger.logkv_mean("metric_cosine_std", float(metric_debug["cosine_std"].cpu()))
+
+        if tb_writer is not None and step % args.tb_log_interval == 0:
+            with torch.no_grad():
+                tb_writer.add_scalar("train/loss", float(loss.detach().cpu()), step)
+
+                if args.metric == "cosine":
+                    scale_for_log = model.get_scale().detach().float()
+                    tb_writer.add_scalar("metric/scale", float(scale_for_log.cpu()), step)
+                    tb_writer.add_scalar(
+                        "metric/log_scale",
+                        float(model.log_scale.detach().float().cpu()),
+                        step,
+                    )
+                    tb_writer.add_scalar(
+                        "metric/temperature",
+                        float((1.0 / scale_for_log.clamp_min(args.scale_eps)).cpu()),
+                        step,
+                    )
+                    tb_writer.add_scalar(
+                        "metric/cosine_mean",
+                        float(metric_debug["cosine_mean"].cpu()),
+                        step,
+                    )
+                    tb_writer.add_scalar(
+                        "metric/cosine_std",
+                        float(metric_debug["cosine_std"].cpu()),
+                        step,
+                    )
+                    tb_writer.add_scalar(
+                        "metric/cosine_min",
+                        float(metric_debug["cosine_min"].cpu()),
+                        step,
+                    )
+                    tb_writer.add_scalar(
+                        "metric/cosine_max",
+                        float(metric_debug["cosine_max"].cpu()),
+                        step,
+                    )
+
         scaler.scale(loss / args.accumulation_steps).backward()
         
         # accumulate
@@ -139,9 +223,9 @@ def main():
             logger.logkv("step", step)
             logger.logkv("effective_step", effective_step)
             logger.logkv("lr", current_lr)
-            kvs = logger.dumpkvs()
-            tb_writer.add_scalar("train/loss", kvs.get("loss", 0.0), step)
-            tb_writer.add_scalar("train/lr", current_lr, step)
+            logger.dumpkvs()
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/lr", current_lr, step)
         
         # save checkpoint
         if step % args.save_interval == 0: 
@@ -189,7 +273,17 @@ def main():
                             outputs = model(batch_data)
                         outputs = rearrange(outputs, '(n b) l -> 1 b n l', n=2) # we change the subscript sequence
 
-                        _, scores = compute_prototypical_loss(outputs, labels, args.num_support_val)
+                        if args.metric == "cosine":
+                            scale = model.get_scale()
+                            _, scores, _ = compute_cosine_prototypical_loss(
+                                outputs,
+                                labels,
+                                args.num_support_val,
+                                scale=scale,
+                                eps=args.scale_eps,
+                            )
+                        else:
+                            _, scores = compute_prototypical_loss(outputs, labels, args.num_support_val)
                         
                         prob = scores.softmax(dim=-1).cpu()
                         labels = labels.cpu()
@@ -204,11 +298,13 @@ def main():
 
                     logger.info(f'Evaluation on {VAL_FOLDERS[i]} done. evaluating num: {len(total_prob)}, accuracy: {acc}, average precision: {ap}. ')
                     split_tag = "val_unseen" if VAL_FOLDERS[i] == args.exclude_class else "val_seen"
-                    tb_writer.add_scalar(f"{split_tag}/acc_{VAL_FOLDERS[i]}", acc.item(), step)
-                    tb_writer.add_scalar(f"{split_tag}/ap_{VAL_FOLDERS[i]}", ap.item(), step)
+                    if tb_writer is not None:
+                        tb_writer.add_scalar(f"{split_tag}/acc_{VAL_FOLDERS[i]}", acc.item(), step)
+                        tb_writer.add_scalar(f"{split_tag}/ap_{VAL_FOLDERS[i]}", ap.item(), step)
         ##### evaluation done #####
     
-    tb_writer.close()
+    if tb_writer is not None:
+        tb_writer.close()
     #################################################
 
 

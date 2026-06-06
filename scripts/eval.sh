@@ -24,6 +24,10 @@ OUTPUT_PATH=${OUTPUT_PATH:-"./output_dir/exclude_${TEST_CLASS}"}
 # Default checkpoint path matches what save_model() writes: resnet50_step[N].pth
 TOTAL_STEPS=${TOTAL_STEPS:-15000}
 CKPT_PATH=${CKPT_PATH:-"${OUTPUT_PATH}/ckpt/resnet50_step[${TOTAL_STEPS}].pth"}
+METRIC=${METRIC:-squared_euclidean}
+INIT_SCALE=${INIT_SCALE:-10.0}
+MAX_SCALE=${MAX_SCALE:-100.0}
+SCALE_EPS=${SCALE_EPS:-1e-12}
 
 mkdir -p "$OUTPUT_PATH"
 
@@ -37,4 +41,8 @@ python test.py \
     --num_class_test 2 \
     --num_support_test 5 \
     --num_query_test 15 \
-    --use_fp16 True
+    --use_fp16 True \
+    --metric "$METRIC" \
+    --init_scale $INIT_SCALE \
+    --max_scale $MAX_SCALE \
+    --scale_eps $SCALE_EPS
