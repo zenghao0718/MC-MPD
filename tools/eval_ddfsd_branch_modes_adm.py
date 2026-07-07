@@ -204,7 +204,7 @@ def evaluate_all_branch_modes(
 
 
 def load_checkpoint(path: str, model):
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"DDFSD checkpoint has no 'model' key: {path}")
     model.load_state_dict(checkpoint["model"])

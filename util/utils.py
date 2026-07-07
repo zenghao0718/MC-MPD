@@ -118,7 +118,7 @@ def load_model(filename, **kwargs):
         Immutable objects will be assigned with saved values. 
     """
     
-    checkpoint = torch.load(filename, map_location='cpu') #always cpu is well
+    checkpoint = torch.load(filename, map_location='cpu', weights_only=False) #always cpu is well
 
     for k, v in kwargs.items(): 
         assert k in checkpoint, 'Key "%s" has not been found in checkpoint %s' % (k, filename)
