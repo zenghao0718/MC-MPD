@@ -54,6 +54,15 @@ BRANCH_MODE_STEPS_DEFAULT = [2500, 5000, 7500, 10000, 12500, 15000]
 ALPHA_GRID_STEPS_DEFAULT = [7500, 12500, 15000]
 EVAL_SEEDS_DEFAULT = "42,101,102,103,104"
 
+# Deployment only ever uses the 12500 or 15000 checkpoint, so every "best
+# result" selection (best checkpoint, best branch mode, best fixed alpha)
+# must restrict its candidate set to these two steps. Earlier checkpoints
+# (2500/5000/7500/10000) are still shown in the raw per-checkpoint tables
+# for transparency, but are never picked as "the best".
+FINAL_CKPTS = [12500, 15000]
+
+DEFAULT_BASELINE_CSV = "/root/autodl-tmp/runs/baseline_fsd_paper/summary_10shot/baseline_10shot_5seed_summary.csv"
+
 
 def read_csv(path: str) -> List[Dict[str, str]]:
     if not path or not os.path.exists(path):
@@ -196,6 +205,16 @@ def judge_ratio(count: int, total: int, true_label: str, false_label: str) -> st
     return f"当前数据部分支持（{count}/{total} 个 checkpoint 上成立）"
 
 
+def combined_score(row: Dict) -> Optional[float]:
+    """AP+ACC combined selection score. Returns None if either is missing so
+    that callers never silently pick a "best" based on AP alone."""
+    ap = to_float(row.get("ap_mean"))
+    acc = to_float(row.get("acc_mean"))
+    if ap is None or acc is None:
+        return None
+    return ap + acc
+
+
 def branch_modes_judgements(branch_rows: List[Dict]) -> Dict:
     steps = sorted({to_int(r["ckpt_step"]) for r in branch_rows if r.get("ckpt_step") is not None})
     by_step_mode = {}
@@ -246,8 +265,13 @@ def branch_modes_judgements(branch_rows: List[Dict]) -> Dict:
     }
 
 
-def alpha_grid_judgements(alpha_rows: List[Dict]) -> Dict:
+def alpha_grid_judgements(alpha_rows: List[Dict], allowed_steps: Optional[List[int]] = None) -> Dict:
+    """Per-step best-fixed-alpha vs adaptive comparison, selected by the
+    combined AP+ACC score (never AP alone). If allowed_steps is given, only
+    those checkpoint steps are considered (deployment-relevant steps)."""
     steps = sorted({to_int(r["ckpt_step"]) for r in alpha_rows if r.get("ckpt_step") is not None})
+    if allowed_steps is not None:
+        steps = [s for s in steps if s in allowed_steps]
     by_step_mode = {}
     for r in alpha_rows:
         by_step_mode[(to_int(r["ckpt_step"]), r["alpha_mode"])] = r
@@ -259,19 +283,23 @@ def alpha_grid_judgements(alpha_rows: List[Dict]) -> Dict:
         adaptive = by_step_mode.get((step, "adaptive"))
         if not adaptive:
             continue
-        ap_adaptive = to_float(adaptive.get("ap_mean"))
+        score_adaptive = combined_score(adaptive)
         fixed_candidates = []
         for mode_key in ("0", "0.25", "0.5", "0.75", "1"):
             row = by_step_mode.get((step, mode_key))
             if row is None:
                 continue
-            fixed_candidates.append((mode_key, to_float(row.get("ap_mean")), row))
-        if not fixed_candidates or ap_adaptive is None:
+            fixed_candidates.append((mode_key, combined_score(row), row))
+        if not fixed_candidates or score_adaptive is None:
             continue
         total += 1
-        best_mode, best_ap, best_row = max(fixed_candidates, key=lambda item: (item[1] if item[1] is not None else -1))
-        best_fixed_per_step[step] = (best_mode, best_ap, best_row, ap_adaptive)
-        if best_ap is not None and best_ap > ap_adaptive:
+        best_mode, best_score, best_row = max(
+            fixed_candidates, key=lambda item: (item[1] if item[1] is not None else -1)
+        )
+        best_ap = to_float(best_row.get("ap_mean"))
+        ap_adaptive = to_float(adaptive.get("ap_mean"))
+        best_fixed_per_step[step] = (best_mode, best_ap, best_row, ap_adaptive, adaptive)
+        if best_score is not None and best_score > score_adaptive:
             fixed_beats_adaptive += 1
 
     return {
@@ -338,7 +366,10 @@ def build_alpha_grid_table(alpha_rows: List[Dict]) -> str:
     ]
     for r in rows:
         r = normalize_alpha_grid_row(r)
-        alpha_label = "adaptive" if r["alpha_mode"] == "adaptive" else r["alpha_mode"]
+        if r["alpha_mode"] == "adaptive":
+            alpha_label = f"adaptive（{fmt(r.get('adaptive_alpha_mean'))}）"
+        else:
+            alpha_label = r["alpha_mode"]
         lines.append(
             f"| {r['ckpt_step']} | {alpha_label} | {r.get('fixed_alpha', '')} | "
             f"{fmt_pm(r.get('acc_mean'), r.get('acc_std'))} | {fmt_pm(r.get('ap_mean'), r.get('ap_std'))} | "
@@ -364,11 +395,24 @@ def build_train_alpha_loss_table(train_rows: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def best_ckpt_by_ap(formal_rows: List[Dict]) -> Optional[Dict]:
-    rows = [r for r in formal_rows if to_float(r.get("ap_mean")) is not None]
+def best_ckpt_by_ap_acc(formal_rows: List[Dict], allowed_steps: Optional[List[int]] = None) -> Optional[Dict]:
+    """Pick the best checkpoint using the combined AP+ACC score (never AP
+    alone). If allowed_steps is given, only those steps are eligible (used to
+    restrict "best checkpoint" selection to the checkpoints that would
+    actually be deployed, i.e. 12500/15000)."""
+    rows = []
+    for r in formal_rows:
+        step = to_int(r.get("ckpt_step"))
+        if allowed_steps is not None and step not in allowed_steps:
+            continue
+        score = combined_score(r)
+        if score is None:
+            continue
+        rows.append((score, r))
     if not rows:
         return None
-    return max(rows, key=lambda r: to_float(r["ap_mean"]))
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return rows[0][1]
 
 
 def build_per_class_summary(
@@ -396,8 +440,8 @@ def build_per_class_summary(
     train_table = build_train_alpha_loss_table(train_rows)
 
     bj = branch_modes_judgements(branch_rows)
-    aj = alpha_grid_judgements(alpha_rows)
-    best_formal = best_ckpt_by_ap(formal_rows)
+    aj = alpha_grid_judgements(alpha_rows, allowed_steps=FINAL_CKPTS)
+    best_formal = best_ckpt_by_ap_acc(formal_rows, allowed_steps=FINAL_CKPTS)
     rf_zero_count, rf_total = loss_near_zero(train_rows, "loss_rf")
     ff_zero_count, ff_total = loss_near_zero(train_rows, "loss_ff")
 
@@ -426,20 +470,22 @@ def build_per_class_summary(
     )
 
     best_alpha_lines = []
-    for step, (mode, ap, row, ap_adaptive) in sorted(aj["best_fixed_per_step"].items()):
+    for step, (mode, ap, row, ap_adaptive, adaptive_row) in sorted(aj["best_fixed_per_step"].items()):
         best_alpha_lines.append(
-            f"  - step{step}: 最优固定 alpha={mode}（AP={fmt(ap)}），adaptive AP={fmt(ap_adaptive)}"
+            f"  - step{step}: 最优固定 alpha={mode}（ACC={fmt(row.get('acc_mean'))}, AP={fmt(ap)}，"
+            f"按 AP+ACC 综合选出）；adaptive（ACC={fmt(adaptive_row.get('acc_mean'))}, AP={fmt(ap_adaptive)}，"
+            f"adaptive_alpha_mean={fmt(adaptive_row.get('adaptive_alpha_mean'))}）"
         )
-    best_alpha_block = "\n".join(best_alpha_lines) if best_alpha_lines else "  - 无可比较数据"
+    best_alpha_block = "\n".join(best_alpha_lines) if best_alpha_lines else "  - 无可比较数据（候选 checkpoint 限定为 12500/15000）"
 
     if best_formal is not None:
         best_ckpt_line = (
-            f"最优 checkpoint（按正式 dual 测试 AP）：step{best_formal['ckpt_step']}"
-            f"（AP={fmt(best_formal.get('ap_mean'))}, AUC={fmt(best_formal.get('auc_mean'))}, "
-            f"ACC={fmt(best_formal.get('acc_mean'))}）"
+            f"最优 checkpoint（候选限定为 12500/15000，按 AP+ACC 综合评分选出）：step{best_formal['ckpt_step']}"
+            f"（AP={fmt(best_formal.get('ap_mean'))}, ACC={fmt(best_formal.get('acc_mean'))}, "
+            f"AUC={fmt(best_formal.get('auc_mean'))}）"
         )
     else:
-        best_ckpt_line = "最优 checkpoint：不能确认（正式测试数据缺失）"
+        best_ckpt_line = "最优 checkpoint：不能确认（正式测试数据缺失，或 12500/15000 均缺失）"
 
     loss_rf_judgement = (
         f"{rf_zero_count}/{rf_total} 个 checkpoint 的 loss_rf < 0.01" if rf_total else "不能确认（训练日志解析失败或缺失）"
@@ -570,18 +616,111 @@ def cn_count_label(n: int) -> str:
     return CN_DIGITS.get(n, str(n))
 
 
-def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: str, repo_root: str) -> str:
+def load_baseline_summary(baseline_csv: str) -> Dict[Tuple[str, int], Dict]:
+    """Load the FSD-paper-reproduction baseline (10-shot, 5-seed) summary CSV.
+    Never fabricates: returns {} if the file is missing."""
+    data: Dict[Tuple[str, int], Dict] = {}
+    for row in read_csv(baseline_csv):
+        cls = row.get("class")
+        step = to_int(row.get("step"))
+        if not cls or cls == "MACRO_AVG" or step is None:
+            continue
+        data[(cls, step)] = row
+    return data
+
+
+def build_ckpt_fixed_table(class_data_list: List[Dict], step: int) -> str:
+    """Straight (non-"best of") formal dual result at one specific checkpoint,
+    for every class. Used for the 12500-step and 15000-step deployment tables."""
+    lines = ["| exclude_class | ACC mean/std | AP mean/std | AUC mean/std |", "|---|---|---|---|"]
+    for cd in class_data_list:
+        row = next((r for r in cd["formal_rows"] if to_int(r.get("ckpt_step")) == step), None)
+        if row is None:
+            lines.append(f"| {cd['exclude_class']} | NA | NA | NA |")
+        else:
+            lines.append(
+                f"| {cd['exclude_class']} | {fmt_pm(row.get('acc_mean'), row.get('acc_std'))} | "
+                f"{fmt_pm(row.get('ap_mean'), row.get('ap_std'))} | {fmt_pm(row.get('auc_mean'), row.get('auc_std'))} |"
+            )
+    return "\n".join(lines)
+
+
+def build_baseline_table(class_data_list: List[Dict], baseline_data: Dict[Tuple[str, int], Dict]) -> str:
+    lines = [
+        "| exclude_class | step | ACC mean/std (baseline) | AP mean/std (baseline) |",
+        "|---|---|---|---|",
+    ]
+    for cd in class_data_list:
+        for step in FINAL_CKPTS:
+            row = baseline_data.get((cd["exclude_class"], step))
+            if row is None:
+                lines.append(f"| {cd['exclude_class']} | {step} | NA | NA |")
+            else:
+                lines.append(
+                    f"| {cd['exclude_class']} | {step} | {fmt_pm(row.get('acc_mean'), row.get('acc_std'))} | "
+                    f"{fmt_pm(row.get('ap_mean'), row.get('ap_std'))} |"
+                )
+    return "\n".join(lines)
+
+
+def build_baseline_comparison_table(
+    class_data_list: List[Dict], baseline_data: Dict[Tuple[str, int], Dict], step: int
+) -> str:
+    lines = [
+        "| exclude_class | DDFSD ACC | DDFSD AP | baseline ACC | baseline AP | ΔACC | ΔAP | 结论 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for cd in class_data_list:
+        ddfsd_row = next((r for r in cd["formal_rows"] if to_int(r.get("ckpt_step")) == step), None)
+        base_row = baseline_data.get((cd["exclude_class"], step))
+        ddfsd_acc = to_float(ddfsd_row.get("acc_mean")) if ddfsd_row else None
+        ddfsd_ap = to_float(ddfsd_row.get("ap_mean")) if ddfsd_row else None
+        base_acc = to_float(base_row.get("acc_mean")) if base_row else None
+        base_ap = to_float(base_row.get("ap_mean")) if base_row else None
+        if None in (ddfsd_acc, ddfsd_ap, base_acc, base_ap):
+            lines.append(
+                f"| {cd['exclude_class']} | {fmt(ddfsd_acc)} | {fmt(ddfsd_ap)} | {fmt(base_acc)} | {fmt(base_ap)} | "
+                f"NA | NA | 不能确认（DDFSD 或 baseline 数据缺失） |"
+            )
+            continue
+        delta_acc = ddfsd_acc - base_acc
+        delta_ap = ddfsd_ap - base_ap
+        if delta_acc > 0 and delta_ap > 0:
+            conclusion = "当前数据支持：DDFSD 同时超过 baseline（ACC 和 AP）"
+        elif delta_acc <= 0 and delta_ap <= 0:
+            conclusion = "当前数据不支持：DDFSD 未超过 baseline（ACC 和 AP 均未超过）"
+        elif delta_acc > 0:
+            conclusion = "部分支持：仅 ACC 超过 baseline，AP 未超过"
+        else:
+            conclusion = "部分支持：仅 AP 超过 baseline，ACC 未超过"
+        lines.append(
+            f"| {cd['exclude_class']} | {fmt(ddfsd_acc)} | {fmt(ddfsd_ap)} | {fmt(base_acc)} | {fmt(base_ap)} | "
+            f"{delta_acc:+.4f} | {delta_ap:+.4f} | {conclusion} |"
+        )
+    return "\n".join(lines)
+
+
+def build_combined_markdown(
+    class_data_list: List[Dict],
+    title: str,
+    run_root: str,
+    repo_root: str,
+    baseline_data: Optional[Dict[Tuple[str, int], Dict]] = None,
+) -> str:
     git_commit = get_git_commit(repo_root)
     n_label = cn_count_label(len(class_data_list))
+    baseline_data = baseline_data or {}
 
-    # Table 1: best formal ckpt per class
+    # Table 1: best formal ckpt per class. Candidates are restricted to
+    # FINAL_CKPTS (12500/15000, the only checkpoints ever deployed), and the
+    # "best" is chosen by the combined AP+ACC score, never AP alone.
     t1_lines = [
-        "| exclude_class | best_ckpt_by_AP | ACC mean/std | AP mean/std | AUC mean/std |",
+        "| exclude_class | best_ckpt | ACC mean/std | AP mean/std | AUC mean/std |",
         "|---|---|---|---|---|",
     ]
     best_formal_by_class = {}
     for cd in class_data_list:
-        best = best_ckpt_by_ap(cd["formal_rows"])
+        best = best_ckpt_by_ap_acc(cd["formal_rows"], allowed_steps=FINAL_CKPTS)
         best_formal_by_class[cd["exclude_class"]] = best
         if best is None:
             t1_lines.append(f"| {cd['exclude_class']} | NA | NA | NA | NA |")
@@ -591,9 +730,9 @@ def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: s
                 f"{fmt_pm(best.get('ap_mean'), best.get('ap_std'))} | {fmt_pm(best.get('auc_mean'), best.get('auc_std'))} |"
             )
 
-    # Table 2: three-mode best at that class's best formal ckpt
+    # Table 2: three-mode best at that class's best formal ckpt (also AP+ACC combined)
     t2_lines = [
-        "| exclude_class | ckpt_step | best_branch_by_AP | dual_AP | freq_only_AP | rgb_only_AP | dual_ACC | freq_only_ACC | rgb_only_ACC | adaptive_alpha_mean |",
+        "| exclude_class | ckpt_step | best_branch | dual_AP | freq_only_AP | rgb_only_AP | dual_ACC | freq_only_ACC | rgb_only_ACC | adaptive_alpha_mean |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for cd in class_data_list:
@@ -604,36 +743,49 @@ def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: s
         if not (dual and freq and rgb):
             t2_lines.append(f"| {cd['exclude_class']} | {step if step else 'NA'} | NA | NA | NA | NA | NA | NA | NA | NA |")
             continue
-        aps = {"dual": to_float(dual.get("ap_mean")), "freq-only": to_float(freq.get("ap_mean")), "rgb-only": to_float(rgb.get("ap_mean"))}
-        best_mode = max(aps, key=lambda k: aps[k] if aps[k] is not None else -1)
+        scores = {"dual": combined_score(dual), "freq-only": combined_score(freq), "rgb-only": combined_score(rgb)}
+        best_mode = max(scores, key=lambda k: scores[k] if scores[k] is not None else -1)
         t2_lines.append(
             f"| {cd['exclude_class']} | {step} | {best_mode} | {fmt(dual.get('ap_mean'))} | {fmt(freq.get('ap_mean'))} | "
             f"{fmt(rgb.get('ap_mean'))} | {fmt(dual.get('acc_mean'))} | {fmt(freq.get('acc_mean'))} | {fmt(rgb.get('acc_mean'))} | "
             f"{fmt(dual.get('adaptive_alpha_mean'))} |"
         )
 
-    # Table 3: fixed alpha best result per class
+    # Table 3: fixed alpha best result per class. Candidate checkpoints are
+    # restricted to FINAL_CKPTS (alpha_grid was tested at 7500/12500/15000,
+    # but 7500 is never a deployment candidate), and both the "which step"
+    # and "which alpha (fixed or adaptive)" choices use the combined AP+ACC
+    # score. When adaptive wins, its exact numeric value is shown inline.
     t3_lines = [
-        "| exclude_class | ckpt_step | best_alpha_by_AP | adaptive_AP | best_fixed_alpha_AP | best_fixed_alpha | adaptive_alpha_mean | used_alpha_mean |",
-        "|---|---|---|---|---|---|---|---|",
+        "| exclude_class | ckpt_step | best_alpha | best_ACC | best_AP | adaptive_ACC | adaptive_AP | adaptive_alpha_mean | used_alpha_mean |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for cd in class_data_list:
-        aj = alpha_grid_judgements(cd["alpha_rows"])
-        best_step, best_entry = None, None
+        aj = alpha_grid_judgements(cd["alpha_rows"], allowed_steps=FINAL_CKPTS)
+        best_step, best_entry, best_step_score = None, None, None
         for step, entry in aj["best_fixed_per_step"].items():
-            if best_entry is None or (entry[1] or -1) > (best_entry[1] or -1):
-                best_step, best_entry = step, entry
+            _, _, fixed_row, _, adaptive_row = entry
+            candidate_scores = [s for s in (combined_score(fixed_row), combined_score(adaptive_row)) if s is not None]
+            if not candidate_scores:
+                continue
+            step_score = max(candidate_scores)
+            if best_step_score is None or step_score > best_step_score:
+                best_step_score, best_step, best_entry = step_score, step, entry
         if best_step is None:
-            t3_lines.append(f"| {cd['exclude_class']} | NA | NA | NA | NA | NA | NA | NA |")
+            t3_lines.append(f"| {cd['exclude_class']} | NA | NA | NA | NA | NA | NA | NA | NA |")
             continue
-        best_mode, best_ap, best_row, ap_adaptive = best_entry
-        overall_best = "adaptive" if (ap_adaptive is not None and best_ap is not None and ap_adaptive >= best_ap) else best_mode
-        adaptive_row = next(
-            (r for r in cd["alpha_rows"] if to_int(r["ckpt_step"]) == best_step and r["alpha_mode"] == "adaptive"),
-            {},
-        )
+        mode, best_ap, best_row, ap_adaptive, adaptive_row = best_entry
+        fixed_score = combined_score(best_row)
+        adaptive_score = combined_score(adaptive_row)
+        if adaptive_score is not None and (fixed_score is None or adaptive_score >= fixed_score):
+            best_alpha_label = f"adaptive（{fmt(adaptive_row.get('adaptive_alpha_mean'))}）"
+            winner_row = adaptive_row
+        else:
+            best_alpha_label = mode
+            winner_row = best_row
         t3_lines.append(
-            f"| {cd['exclude_class']} | {best_step} | {overall_best} | {fmt(ap_adaptive)} | {fmt(best_ap)} | {best_mode} | "
+            f"| {cd['exclude_class']} | {best_step} | {best_alpha_label} | {fmt(winner_row.get('acc_mean'))} | "
+            f"{fmt(winner_row.get('ap_mean'))} | {fmt(adaptive_row.get('acc_mean'))} | {fmt(ap_adaptive)} | "
             f"{fmt(adaptive_row.get('adaptive_alpha_mean'))} | {fmt(best_row.get('used_alpha_mean'))} |"
         )
 
@@ -658,7 +810,7 @@ def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: s
     ]
     for cd in class_data_list:
         bj = branch_modes_judgements(cd["branch_rows"])
-        aj = alpha_grid_judgements(cd["alpha_rows"])
+        aj = alpha_grid_judgements(cd["alpha_rows"], allowed_steps=FINAL_CKPTS)
         rf_zero_count, rf_total = loss_near_zero(cd["train_rows"], "loss_rf")
         ff_zero_count, ff_total = loss_near_zero(cd["train_rows"], "loss_ff")
         freq_j = judge_ratio(bj["freq_gt_rgb_count"], bj["steps_compared"], "支持", "不支持")
@@ -677,6 +829,38 @@ def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: s
             f"| {cd['exclude_class']} | {freq_j} | {dual_j} | {alpha_j} | {fixed_j} | {rf_j} | {ff_j} | {short_conclusion} |"
         )
 
+    # Tables 6/7: straight (non-"best of") results at exactly ckpt=12500 and ckpt=15000,
+    # since deployment will only ever use one of these two checkpoints.
+    t6_ckpt12500 = build_ckpt_fixed_table(class_data_list, 12500)
+    t7_ckpt15000 = build_ckpt_fixed_table(class_data_list, 15000)
+
+    # Table 8/9/10: FSD-paper-reproduction baseline and comparisons (only built if
+    # baseline data was found; never fabricated).
+    has_baseline = bool(baseline_data)
+    if has_baseline:
+        t8_baseline = build_baseline_table(class_data_list, baseline_data)
+        t9_cmp_12500 = build_baseline_comparison_table(class_data_list, baseline_data, 12500)
+        t10_cmp_15000 = build_baseline_comparison_table(class_data_list, baseline_data, 15000)
+        baseline_block = f"""## 表 8：Baseline（原论文 10-shot 5-seed 复现结果，来自 `runs/baseline_fsd_paper`）
+
+数据来源：`{DEFAULT_BASELINE_CSV}`（resnet50 backbone，`use_dual_branch=False`，seeds=42/101/102/103/104，与 DDFSD 正式测试使用相同的 10-shot 协议，仅骨干网络和 dual-branch 结构不同）。baseline 未记录 AUC，故此表和下面两个对比表只对比 ACC 和 AP。
+
+{t8_baseline}
+
+## 表 9：DDFSD（ckpt=12500）vs Baseline（step=12500）对比
+
+{t9_cmp_12500}
+
+## 表 10：DDFSD（ckpt=15000）vs Baseline（step=15000）对比
+
+{t10_cmp_15000}
+"""
+    else:
+        baseline_block = (
+            "## 表 8/9/10：Baseline 对比\n\n"
+            f"未在 `{DEFAULT_BASELINE_CSV}` 找到 baseline 数据，因此未生成 baseline 复现表和对比表，不做编造。\n"
+        )
+
     class_names = ", ".join(cd["exclude_class"] for cd in class_data_list)
     md = f"""# {title}
 
@@ -686,16 +870,17 @@ def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: s
 - 覆盖类别：{class_names}
 - TensorBoard 启动命令：`tensorboard --logdir {run_root} --host 0.0.0.0 --port 6006`
 - TensorBoard logdir：`{run_root}`
+- **重要约定**：部署最终只会使用 ckpt=12500 或 ckpt=15000 之一，因此下面所有"最佳结果"的候选 checkpoint 都限定为 {{12500, 15000}}（不含 2500/5000/7500/10000），并且一律用 AP+ACC 的组合评分（两者之和）来判断"最佳"，不单独只看 AP。当选出的最佳是 adaptive 时，会同时标出它在该 checkpoint 上的确切数值，例如 `adaptive（0.7500）`。
 
-## 表 1：{n_label}类正式 dual 最佳结果（按 AP 选择 checkpoint）
+## 表 1：{n_label}类正式 dual 最佳结果（候选 ckpt∈{{12500,15000}}，按 AP+ACC 综合评分选择）
 
 {chr(10).join(t1_lines)}
 
-## 表 2：{n_label}类三模式最佳结果（在各自表1的最佳 checkpoint 上比较）
+## 表 2：{n_label}类三模式最佳结果（在各自表1的最佳 checkpoint 上比较，按 AP+ACC 综合评分选择）
 
 {chr(10).join(t2_lines)}
 
-## 表 3：{n_label}类 fixed alpha 最佳结果（在 alpha_grid 已测的 checkpoint 中，取 adaptive AP 最高的一个）
+## 表 3：{n_label}类 fixed alpha 最佳结果（候选 ckpt∈{{12500,15000}}，按 AP+ACC 综合评分在 adaptive 和 5 个固定值之间选择）
 
 {chr(10).join(t3_lines)}
 
@@ -703,13 +888,23 @@ def build_combined_markdown(class_data_list: List[Dict], title: str, run_root: s
 
 {chr(10).join(t4_lines)}
 
-## 表 5：{n_label}类现象判断表
+## 表 5：{n_label}类现象判断表（"fixed alpha 超过 adaptive" 一列的候选 ckpt 同样限定为 {{12500,15000}}）
 
 {chr(10).join(t5_lines)}
 
+## 表 6：{n_label}类在 ckpt=12500 下的正式 dual 结果（非"最佳"，直接取该 checkpoint 的实测值）
+
+{t6_ckpt12500}
+
+## 表 7：{n_label}类在 ckpt=15000 下的正式 dual 结果（非"最佳"，直接取该 checkpoint 的实测值）
+
+{t7_ckpt15000}
+
+{baseline_block}
+
 ## 说明
 
-- 所有数值均直接来自各类别的 `formal_eval/branch_modes/alpha_grid/csv` 目录下的 CSV，未做任何人工调整。
+- 所有数值均直接来自各类别的 `formal_eval/branch_modes/alpha_grid/csv` 目录下的 CSV，以及 baseline 的 `summary_10shot` 目录下的 CSV，未做任何人工调整。
 - "支持/不支持/不能确认" 为对当前一次训练+评测观察到的现象的描述，不构成因果证明。
 - 各类别详细数据与逐 checkpoint、逐 seed 结果见各自的 `DDFSD_<CLASS>_FULL_SUMMARY.md`。
 """
@@ -764,11 +959,16 @@ def cmd_combined(args):
         if missing:
             print(f"WARNING: exclude_class={cd['exclude_class']} missing sources: {missing}", file=sys.stderr)
 
+    baseline_data = load_baseline_summary(args.baseline_csv)
+    if not baseline_data:
+        print(f"WARNING: no baseline data found at {args.baseline_csv}", file=sys.stderr)
+
     md = build_combined_markdown(
         class_data_list,
         title="DDFSD Remaining-4 (glide/Midjourney/SD/VQDM) Alpha & Branch 诊断总结",
         run_root=args.run_root,
         repo_root=args.repo_root,
+        baseline_data=baseline_data,
     )
     out_path = os.path.join(args.run_root, "DDFSD_REMAINING4_FULL_SUMMARY.md")
     with open(out_path, "w", encoding="utf-8") as handle:
@@ -808,11 +1008,16 @@ def cmd_all6(args):
         print(f"No ADM/BigGAN data found; wrote placeholder note to {note_path}")
         return
 
+    baseline_data = load_baseline_summary(args.baseline_csv)
+    if not baseline_data:
+        print(f"WARNING: no baseline data found at {args.baseline_csv}", file=sys.stderr)
+
     md = build_combined_markdown(
         class_data_list,
         title="DDFSD ALL6 (ADM/BigGAN/glide/Midjourney/SD/VQDM) Alpha & Branch 诊断总结",
         run_root=args.run_root,
         repo_root=args.repo_root,
+        baseline_data=baseline_data,
     )
     missing_legacy = set(legacy_classes) - set(available_legacy)
     if missing_legacy:
@@ -844,12 +1049,14 @@ def parse_args():
     p_combined.add_argument("--run_root", required=True)
     p_combined.add_argument("--classes", default="glide,Midjourney,SD,VQDM")
     p_combined.add_argument("--repo_root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    p_combined.add_argument("--baseline_csv", default=DEFAULT_BASELINE_CSV)
     p_combined.set_defaults(func=cmd_combined)
 
     p_all6 = sub.add_parser("all6")
     p_all6.add_argument("--run_root", required=True)
     p_all6.add_argument("--classes", default="glide,Midjourney,SD,VQDM")
     p_all6.add_argument("--repo_root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    p_all6.add_argument("--baseline_csv", default=DEFAULT_BASELINE_CSV)
     p_all6.set_defaults(func=cmd_all6)
 
     return parser.parse_args()
