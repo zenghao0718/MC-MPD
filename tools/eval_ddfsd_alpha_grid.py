@@ -348,7 +348,11 @@ SUMMARY_FIELDS = [
     "sigma_freq_mean",
     "sigma_diff_mean",
     "adaptive_alpha_mean",
+    "adaptive_alpha_min",
+    "adaptive_alpha_max",
     "used_alpha_mean",
+    "used_alpha_min",
+    "used_alpha_max",
     "eval_seeds",
     "ckpt_path",
     "freq_stats_path",
@@ -500,15 +504,20 @@ def main():
                         "sigma_freq_mean": statistics.mean([r["sigma_freq_mean"] for r in rows]),
                         "sigma_diff_mean": statistics.mean([r["sigma_diff_mean"] for r in rows]),
                         "adaptive_alpha_mean": statistics.mean([r["adaptive_alpha_mean"] for r in rows]),
+                        "adaptive_alpha_min": min([r["adaptive_alpha_min"] for r in rows]),
+                        "adaptive_alpha_max": max([r["adaptive_alpha_max"] for r in rows]),
                         "used_alpha_mean": statistics.mean([r["used_alpha_mean"] for r in rows]),
+                        "used_alpha_min": min([r["used_alpha_min"] for r in rows]),
+                        "used_alpha_max": max([r["used_alpha_max"] for r in rows]),
                         "eval_seeds": ",".join(str(s) for s in seeds),
                         "ckpt_path": rows[0]["ckpt_path"],
                         "freq_stats_path": args.freq_stats_path,
                     }
                 )
 
-    per_seed_path = os.path.join(args.output_dir, "ddfsd_alpha_grid_per_seed.csv")
-    summary_path = os.path.join(args.output_dir, "ddfsd_alpha_grid_summary.csv")
+    exclude_tag = args.exclude_class
+    per_seed_path = os.path.join(args.output_dir, f"ddfsd_{exclude_tag}_alpha_grid_per_seed.csv")
+    summary_path = os.path.join(args.output_dir, f"ddfsd_{exclude_tag}_alpha_grid_summary.csv")
     write_csv(per_seed_path, per_seed_rows, PER_SEED_FIELDS)
     write_csv(summary_path, summary_rows, SUMMARY_FIELDS)
     logger.info("Saved per-seed CSV: %s", per_seed_path)
