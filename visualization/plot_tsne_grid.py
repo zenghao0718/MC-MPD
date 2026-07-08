@@ -66,6 +66,18 @@ def parse_args():
     parser.add_argument("--feature_modes", type=str, default=",".join(DEFAULT_FEATURE_MODES))
     parser.add_argument("--point_size", type=float, default=3.0)
     parser.add_argument("--dpi", type=int, default=180)
+    parser.add_argument(
+        "--grid_type",
+        type=str,
+        default="both",
+        choices=["both", "four_modes", "all_excludes"],
+        help=(
+            "'four_modes' only builds the per-exclude-class 2x2 (rgb/freq/add/concat) grids. "
+            "'all_excludes' only builds the per-feature-mode 2x3 grids across --exclude_classes. "
+            "'both' (default) builds both. Use 'four_modes' when --exclude_classes is a partial "
+            "subset of the 6 classes to avoid producing a misleading incomplete all-excludes grid."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -227,26 +239,36 @@ def main():
     preflight(run_dir, exclude_classes, feature_modes, args.seed)
     artifacts = load_all(run_dir, exclude_classes, feature_modes, args.seed)
 
-    for exclude_class in exclude_classes:
-        plot_mode_grid(
-            artifacts,
-            exclude_class,
-            feature_modes,
-            args.seed,
-            output_dir,
-            args.point_size,
-            args.dpi,
-        )
-    for feature_mode in feature_modes:
-        plot_exclude_grid(
-            artifacts,
-            feature_mode,
-            exclude_classes,
-            args.seed,
-            output_dir,
-            args.point_size,
-            args.dpi,
-        )
+    if args.grid_type in {"both", "four_modes"}:
+        for exclude_class in exclude_classes:
+            plot_mode_grid(
+                artifacts,
+                exclude_class,
+                feature_modes,
+                args.seed,
+                output_dir,
+                args.point_size,
+                args.dpi,
+            )
+    if args.grid_type in {"both", "all_excludes"}:
+        if len(exclude_classes) < len(DEFAULT_EXCLUDES):
+            print(
+                "Skipping all_excludes grids: --exclude_classes is a partial subset "
+                f"({exclude_classes}) of the full class list ({DEFAULT_EXCLUDES}); "
+                "an incomplete all_excludes grid would misrepresent results. "
+                "Pass --grid_type four_modes explicitly to silence this note."
+            )
+        else:
+            for feature_mode in feature_modes:
+                plot_exclude_grid(
+                    artifacts,
+                    feature_mode,
+                    exclude_classes,
+                    args.seed,
+                    output_dir,
+                    args.point_size,
+                    args.dpi,
+                )
 
 
 if __name__ == "__main__":

@@ -196,7 +196,7 @@ def select_indices(
 
 def build_model(args, device: torch.device):
     model = DDFSDDualDomainNet(pretrained=False, freq_stats_path=args.freq_stats_path)
-    checkpoint = torch.load(args.ckpt_path, map_location="cpu")
+    checkpoint = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"DDFSD checkpoint has no 'model' key: {args.ckpt_path}")
     model.load_state_dict(checkpoint["model"])
