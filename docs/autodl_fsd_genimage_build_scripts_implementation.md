@@ -844,3 +844,53 @@ python tools/check_fsd_genimage_layout.py --root /root/autodl-tmp/data_fsd_full/
 解压脚本是批处理脚本：同一条命令会递归扫描 `--root` 下所有完整 `.zip` 主文件，跳过 `.z01/.z02/.tmp`，成功项写入 done 标记；中断后再次运行同一条命令会跳过已完成项并继续剩余 zip。
 
 本机阶段只做语法检查和小型临时目录验证，不解压真实数据、不构建真实 GenImage、不启动训练或测试。
+
+`check_raw_genimage_for_fsd.py --strict_expected_counts` 只使用 GenImage 公开的全局参考总数做严格检查：`ai=1,350,000`、`nature=1,331,167`、`total=2,681,167`。每个原始来源、每个 leaf 的数量只统计输出，不作为固定官方标准。
+
+---
+
+## 16. manifest 与 20% 小数据集命令
+
+构建全量 FSD 后会在输出目录写入：
+
+```text
+/root/autodl-tmp/data_fsd_full/GenImage/_build_manifest.json
+/root/autodl-tmp/data_fsd_full/GenImage/_build_summary.txt
+```
+
+建议用 manifest 复查全量计数：
+
+```bash
+python tools/check_fsd_genimage_layout.py \
+  --root /root/autodl-tmp/data_fsd_full/GenImage \
+  --manifest /root/autodl-tmp/data_fsd_full/GenImage/_build_manifest.json
+```
+
+从全量 FSD 逐叶子目录抽样 20%：
+
+```bash
+python tools/sample_fsd_genimage_layout.py \
+  --full_root /root/autodl-tmp/data_fsd_full/GenImage \
+  --out_root /root/autodl-tmp/data_fsd_20pct/GenImage \
+  --ratio 0.2 \
+  --seed 42 \
+  --link_mode hardlink
+```
+
+抽样后会在输出目录写入：
+
+```text
+/root/autodl-tmp/data_fsd_20pct/GenImage/_sample_manifest.json
+/root/autodl-tmp/data_fsd_20pct/GenImage/_sample_summary.txt
+```
+
+建议用 manifest 与全量根目录复查 20% 小数据集：
+
+```bash
+python tools/check_fsd_genimage_layout.py \
+  --root /root/autodl-tmp/data_fsd_20pct/GenImage \
+  --manifest /root/autodl-tmp/data_fsd_20pct/GenImage/_sample_manifest.json \
+  --compare_root /root/autodl-tmp/data_fsd_full/GenImage \
+  --ratio 0.2 \
+  --seed 42
+```

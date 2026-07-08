@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Check the final 7-class FSD GenImage layout."""
+"""Check a 7-class FSD GenImage layout and optional manifests/samples."""
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import random
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 
 DEFAULT_ROOT = "/root/autodl-tmp/data_fsd_full/GenImage"
@@ -17,7 +19,7 @@ SOURCE_TAGS = ("sdv14__", "sdv15__", "wukong__", "adm__", "biggan__", "glide__",
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check the final FSD GenImage directory layout.")
-    parser.add_argument("--root", default=DEFAULT_ROOT, help="FSD GenImage root.")
+    parser.add_argument("--root", default=DEFAULT_ROOT, help="FSD GenImage root to check.")
     parser.add_argument("--json_out", default=None, help="Optional JSON report path.")
     parser.add_argument(
         "--sample_open",
@@ -29,6 +31,28 @@ def parse_args() -> argparse.Namespace:
         "--require_source_tag",
         action="store_true",
         help="Fail if image filenames do not contain a known source_tag__ prefix.",
+    )
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Optional _build_manifest.json or _sample_manifest.json to compare leaf counts against.",
+    )
+    parser.add_argument(
+        "--compare_root",
+        default=None,
+        help="Optional full FSD root used to verify that --root is a deterministic sampled subset.",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=float,
+        default=0.2,
+        help="Sampling ratio used with --compare_root. Default: 0.2.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Sampling seed used with --compare_root. Default: 42.",
     )
     return parser.parse_args()
 
@@ -43,6 +67,19 @@ def setup_logging() -> None:
 
 def expected_leaf(class_name: str) -> str:
     return "nature" if class_name == "real" else "ai"
+
+
+def leaf_key(class_name: str, split: str, leaf: str) -> str:
+    return f"{class_name}/{split}/{leaf}"
+
+
+def expected_leaves() -> List[Tuple[str, str, str]]:
+    leaves: List[Tuple[str, str, str]] = []
+    for class_name in EXPECTED_CLASSES:
+        leaf = expected_leaf(class_name)
+        for split in ("train", "val"):
+            leaves.append((class_name, split, leaf))
+    return leaves
 
 
 def collect_dir_items(directory: Path) -> Tuple[List[Path], List[str], List[str]]:
@@ -135,7 +172,9 @@ def check_class(root: Path, class_name: str, sample_open: int, require_source_ta
 
     for split in ("train", "val"):
         directory = class_dir / split / leaf
+        key = leaf_key(class_name, split, leaf)
         split_report: Dict[str, object] = {
+            "leaf_key": key,
             "path": str(directory),
             "exists": directory.is_dir(),
             "image_count": 0,
@@ -197,6 +236,140 @@ def check_class(root: Path, class_name: str, sample_open: int, require_source_ta
     return class_report
 
 
+def leaf_counts_from_reports(reports: Sequence[Dict[str, object]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for report in reports:
+        splits = report.get("splits", {})
+        for split in ("train", "val"):
+            item = splits.get(split, {})
+            key = item.get("leaf_key")
+            if key:
+                counts[str(key)] = int(item.get("image_count", 0))
+    return counts
+
+
+def load_manifest(path: Path) -> Dict[str, object]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def manifest_leaf_counts(manifest: Dict[str, object]) -> Dict[str, int]:
+    leaf_counts = manifest.get("leaf_counts")
+    if not isinstance(leaf_counts, dict):
+        raise ValueError("Manifest does not contain a leaf_counts object.")
+    result: Dict[str, int] = {}
+    for key, item in leaf_counts.items():
+        if isinstance(item, dict):
+            result[str(key)] = int(item.get("count", 0))
+        else:
+            result[str(key)] = int(item)
+    return result
+
+
+def compare_manifest_counts(
+    manifest_path: Path,
+    reports: Sequence[Dict[str, object]],
+) -> Tuple[Dict[str, object], List[str]]:
+    manifest = load_manifest(manifest_path)
+    expected = manifest_leaf_counts(manifest)
+    actual = leaf_counts_from_reports(reports)
+    errors: List[str] = []
+
+    for key, expected_count in expected.items():
+        actual_count = actual.get(key)
+        if actual_count != expected_count:
+            errors.append(f"Manifest count mismatch for {key}: actual={actual_count}, manifest={expected_count}")
+    for key in actual:
+        if key not in expected:
+            errors.append(f"Leaf exists in dataset but not in manifest: {key}")
+
+    return manifest, errors
+
+
+def stable_leaf_seed(seed: int, key: str) -> int:
+    digest = hashlib.sha1(f"{seed}:{key}".encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def sample_size(total: int, ratio: float) -> int:
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+    if total <= 0:
+        return 0
+    return max(1, int(total * ratio))
+
+
+def selected_relative_paths(full_leaf_dir: Path, ratio: float, seed: int, key: str) -> Set[str]:
+    images, _, _ = collect_dir_items(full_leaf_dir)
+    rng = random.Random(stable_leaf_seed(seed, key))
+    shuffled = list(images)
+    rng.shuffle(shuffled)
+    selected = shuffled[: sample_size(len(shuffled), ratio)]
+    return {str(path.relative_to(full_leaf_dir)).replace("\\", "/") for path in selected}
+
+
+def actual_relative_paths(sample_leaf_dir: Path) -> Set[str]:
+    images, _, _ = collect_dir_items(sample_leaf_dir)
+    return {str(path.relative_to(sample_leaf_dir)).replace("\\", "/") for path in images}
+
+
+def same_hardlink(a: Path, b: Path) -> bool:
+    try:
+        a_stat = os.stat(a)
+        b_stat = os.stat(b)
+    except OSError:
+        return False
+    return a_stat.st_dev == b_stat.st_dev and a_stat.st_ino == b_stat.st_ino
+
+
+def compare_sample_to_full(sample_root: Path, full_root: Path, ratio: float, seed: int) -> Tuple[Dict[str, object], List[str]]:
+    errors: List[str] = []
+    report: Dict[str, object] = {
+        "compare_root": str(full_root),
+        "ratio": ratio,
+        "seed": seed,
+        "leaves": {},
+    }
+
+    for class_name, split, leaf in expected_leaves():
+        key = leaf_key(class_name, split, leaf)
+        full_leaf_dir = full_root / class_name / split / leaf
+        sample_leaf_dir = sample_root / class_name / split / leaf
+        if not full_leaf_dir.is_dir():
+            errors.append(f"Missing compare_root leaf: {full_leaf_dir}")
+            continue
+        if not sample_leaf_dir.is_dir():
+            errors.append(f"Missing sample root leaf: {sample_leaf_dir}")
+            continue
+
+        expected_rel = selected_relative_paths(full_leaf_dir, ratio, seed, key)
+        actual_rel = actual_relative_paths(sample_leaf_dir)
+        missing = sorted(expected_rel - actual_rel)
+        extra = sorted(actual_rel - expected_rel)
+        hardlink_mismatches: List[str] = []
+        for rel in sorted(expected_rel & actual_rel):
+            if not same_hardlink(full_leaf_dir / rel, sample_leaf_dir / rel):
+                hardlink_mismatches.append(rel)
+
+        leaf_report = {
+            "expected_count": len(expected_rel),
+            "actual_count": len(actual_rel),
+            "missing_examples": missing[:20],
+            "extra_examples": extra[:20],
+            "hardlink_mismatch_examples": hardlink_mismatches[:20],
+        }
+        report["leaves"][key] = leaf_report
+
+        if missing:
+            errors.append(f"Sample leaf is missing expected files for {key}: {len(missing)}")
+        if extra:
+            errors.append(f"Sample leaf has unexpected files for {key}: {len(extra)}")
+        if hardlink_mismatches:
+            errors.append(f"Sample leaf files are not hardlinks to compare_root for {key}: {len(hardlink_mismatches)}")
+
+    return report, errors
+
+
 def print_table(reports: Sequence[Dict[str, object]]) -> None:
     header = f"{'class':<12} {'train_count':>12} {'val_count':>12} {'status'}"
     print(header)
@@ -230,6 +403,29 @@ def main() -> int:
         errors.extend(str(item) for item in report["errors"])
         warnings.extend(str(item) for item in report["warnings"])
 
+    manifest_report = None
+    if args.manifest:
+        manifest_path = Path(args.manifest).expanduser()
+        try:
+            manifest_report, manifest_errors = compare_manifest_counts(manifest_path, reports)
+            errors.extend(manifest_errors)
+            logging.info("Compared dataset counts against manifest: %s", manifest_path)
+        except Exception as exc:
+            errors.append(f"Manifest comparison failed: {exc}")
+
+    sample_compare_report = None
+    if args.compare_root:
+        compare_root = Path(args.compare_root).expanduser()
+        if not compare_root.is_dir():
+            errors.append(f"compare_root does not exist or is not a directory: {compare_root}")
+        else:
+            try:
+                sample_compare_report, sample_errors = compare_sample_to_full(root, compare_root, args.ratio, args.seed)
+                errors.extend(sample_errors)
+                logging.info("Compared sampled root against full root: %s", compare_root)
+            except Exception as exc:
+                errors.append(f"Sample comparison failed: {exc}")
+
     print()
     print_table(reports)
     print()
@@ -241,6 +437,9 @@ def main() -> int:
     output = {
         "root": str(root),
         "classes": reports,
+        "leaf_counts": leaf_counts_from_reports(reports),
+        "manifest": manifest_report,
+        "sample_compare": sample_compare_report,
         "errors": errors,
         "warnings": warnings,
         "status": "OK" if not errors else "ERROR",

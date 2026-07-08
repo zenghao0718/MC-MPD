@@ -2,6 +2,7 @@
 """Build the 7-class FSD GenImage layout with hardlinks only."""
 
 import argparse
+import datetime as dt
 import json
 import logging
 import os
@@ -91,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow continuing in an existing out_root without overwriting conflicting files.",
     )
-    parser.add_argument("--json_out", default=None, help="Optional JSON build summary path.")
+    parser.add_argument("--json_out", default=None, help="Optional extra JSON build summary path.")
     return parser.parse_args()
 
 
@@ -101,6 +102,19 @@ def setup_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def leaf_key(class_name: str, split: str, leaf: str) -> str:
+    return f"{class_name}/{split}/{leaf}"
 
 
 def is_dataset_root(path: Path) -> bool:
@@ -177,6 +191,16 @@ def collect_image_files(directory: Path) -> List[Path]:
     return files
 
 
+def total_bytes(paths: Sequence[Path]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            logging.warning("Could not stat image file: %s", path)
+    return total
+
+
 def commonpath_is_parent(child: Path, parent: Path) -> bool:
     try:
         common = os.path.commonpath([str(child), str(parent)])
@@ -205,12 +229,17 @@ def init_summary() -> Dict[str, Dict[str, object]]:
     }
 
 
-def make_plan(raw_root: Path, out_root: Path) -> Tuple[List[Dict[str, str]], Dict[str, Dict[str, object]], Dict[str, str]]:
+def make_plan(
+    raw_root: Path,
+    out_root: Path,
+) -> Tuple[List[Dict[str, str]], Dict[str, Dict[str, object]], Dict[str, str], List[Dict[str, object]], Dict[str, Dict[str, object]]]:
     needed_sources = sorted({rule[0] for rule in BUILD_RULES})
     source_roots = {source: find_source_root(raw_root, source) for source in needed_sources}
     summary = init_summary()
     target_seen: Dict[Path, Path] = {}
     plan: List[Dict[str, str]] = []
+    source_dir_counts: List[Dict[str, object]] = []
+    leaf_counts: Dict[str, Dict[str, object]] = {}
 
     for source, src_split, src_leaf, dst_class, dst_split, dst_leaf, tag in BUILD_RULES:
         src_dir = source_roots[source] / src_split / src_leaf
@@ -221,6 +250,41 @@ def make_plan(raw_root: Path, out_root: Path) -> Tuple[List[Dict[str, str]], Dic
             raise ValueError(f"No images found in required source directory: {src_dir}")
 
         dst_dir = out_root / dst_class / dst_split / dst_leaf
+        key = leaf_key(dst_class, dst_split, dst_leaf)
+        image_bytes = total_bytes(images)
+        source_dir_counts.append(
+            {
+                "source": source,
+                "source_dir": str(src_dir),
+                "source_split": src_split,
+                "source_leaf": src_leaf,
+                "target_class": dst_class,
+                "target_split": dst_split,
+                "target_leaf": dst_leaf,
+                "target_key": key,
+                "target_dir": str(dst_dir),
+                "source_tag": tag,
+                "image_count": len(images),
+                "image_bytes": image_bytes,
+                "image_size": format_bytes(image_bytes),
+            }
+        )
+        leaf_entry = leaf_counts.setdefault(
+            key,
+            {
+                "class": dst_class,
+                "split": dst_split,
+                "leaf": dst_leaf,
+                "path": str(dst_dir),
+                "count": 0,
+                "bytes": 0,
+                "size": "0.00 B",
+            },
+        )
+        leaf_entry["count"] = int(leaf_entry["count"]) + len(images)
+        leaf_entry["bytes"] = int(leaf_entry["bytes"]) + image_bytes
+        leaf_entry["size"] = format_bytes(int(leaf_entry["bytes"]))
+
         for src in images:
             dst = dst_dir / f"{tag}__{src.name}"
             if dst in target_seen and target_seen[dst] != src:
@@ -237,14 +301,18 @@ def make_plan(raw_root: Path, out_root: Path) -> Tuple[List[Dict[str, str]], Dic
                     "target": str(dst),
                     "class": dst_class,
                     "split": dst_split,
+                    "leaf": dst_leaf,
+                    "leaf_key": key,
                     "tag": tag,
+                    "source_dir": str(src_dir),
+                    "target_dir": str(dst_dir),
                 }
             )
-            key = "train_count" if dst_split == "train" else "val_count"
-            summary[dst_class][key] = int(summary[dst_class][key]) + 1
+            summary_key = "train_count" if dst_split == "train" else "val_count"
+            summary[dst_class][summary_key] = int(summary[dst_class][summary_key]) + 1
 
     source_root_report = {source: str(path) for source, path in source_roots.items()}
-    return plan, summary, source_root_report
+    return plan, summary, source_root_report, source_dir_counts, leaf_counts
 
 
 def check_existing_targets(plan: Sequence[Dict[str, str]]) -> Tuple[int, List[str]]:
@@ -297,6 +365,113 @@ def print_summary(summary: Dict[str, Dict[str, object]]) -> None:
         )
 
 
+def build_manifest(
+    raw_root: Path,
+    out_root: Path,
+    source_roots: Dict[str, str],
+    summary: Dict[str, Dict[str, object]],
+    source_dir_counts: Sequence[Dict[str, object]],
+    leaf_counts: Dict[str, Dict[str, object]],
+    planned_links: int,
+    existing_matching_links: int,
+    created_links: int,
+    already_present_links: int,
+    status: str,
+) -> Dict[str, object]:
+    return {
+        "manifest_type": "fsd_genimage_build",
+        "version": 1,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "raw_root": str(raw_root),
+        "out_root": str(out_root),
+        "link_mode": "hardlink",
+        "name_policy": "source_prefix",
+        "source_roots": source_roots,
+        "class_summary": summary,
+        "source_dir_counts": list(source_dir_counts),
+        "leaf_counts": leaf_counts,
+        "planned_links": planned_links,
+        "existing_matching_links_before_build": existing_matching_links,
+        "created_links": created_links,
+        "already_present_links": already_present_links,
+        "status": status,
+    }
+
+
+def build_summary_text(manifest: Dict[str, object]) -> str:
+    lines = [
+        "FSD GenImage build summary",
+        f"created_at: {manifest['created_at']}",
+        f"raw_root: {manifest['raw_root']}",
+        f"out_root: {manifest['out_root']}",
+        f"link_mode: {manifest['link_mode']}",
+        f"name_policy: {manifest['name_policy']}",
+        f"planned_links: {manifest['planned_links']}",
+        f"created_links: {manifest['created_links']}",
+        f"already_present_links: {manifest['already_present_links']}",
+        "",
+        "class summary",
+        f"{'class':<12} {'train_count':>12} {'val_count':>12} sources",
+        "-" * 72,
+    ]
+    class_summary = manifest["class_summary"]
+    for class_name in EXPECTED_CLASSES:
+        item = class_summary[class_name]
+        lines.append(
+            f"{class_name:<12} {item['train_count']:>12} {item['val_count']:>12} {item['sources']}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "source directory hardlink counts",
+            f"{'source':<24} {'target':<24} {'count':>12} {'size':>12} source_dir",
+            "-" * 120,
+        ]
+    )
+    for item in manifest["source_dir_counts"]:
+        lines.append(
+            f"{item['source']:<24} {item['target_key']:<24} {item['image_count']:>12} "
+            f"{item['image_size']:>12} {item['source_dir']}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_text_checked(path: Path, text: str, allow_overwrite: bool) -> None:
+    if path.exists():
+        old_text = path.read_text(encoding="utf-8")
+        if old_text == text:
+            logging.info("Metadata already up to date: %s", path)
+            return
+        if not allow_overwrite:
+            raise FileExistsError(f"Metadata file already exists and differs: {path}")
+        logging.warning("Overwriting metadata file during --resume: %s", path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def write_metadata(
+    out_root: Path,
+    manifest: Dict[str, object],
+    allow_overwrite: bool,
+    extra_json_out: str,
+) -> None:
+    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+    summary_text = build_summary_text(manifest)
+    manifest_path = out_root / "_build_manifest.json"
+    summary_path = out_root / "_build_summary.txt"
+    write_text_checked(manifest_path, manifest_text + "\n", allow_overwrite)
+    write_text_checked(summary_path, summary_text, allow_overwrite)
+    logging.info("Build manifest written: %s", manifest_path)
+    logging.info("Build summary written: %s", summary_path)
+
+    if extra_json_out:
+        json_path = Path(extra_json_out).expanduser()
+        write_text_checked(json_path, manifest_text + "\n", allow_overwrite)
+        logging.info("Extra JSON summary written: %s", json_path)
+
+
 def main() -> int:
     args = parse_args()
     setup_logging()
@@ -319,7 +494,7 @@ def main() -> int:
         return 2
 
     try:
-        plan, summary, source_roots = make_plan(raw_root, out_root)
+        plan, summary, source_roots, source_dir_counts, leaf_counts = make_plan(raw_root, out_root)
         existing_same, existing_errors = check_existing_targets(plan)
         if existing_errors:
             for error in existing_errors:
@@ -335,47 +510,37 @@ def main() -> int:
     print_summary(summary)
     print()
 
-    output = {
-        "raw_root": str(raw_root),
-        "out_root": str(out_root),
-        "link_mode": "hardlink",
-        "name_policy": "source_prefix",
-        "source_roots": source_roots,
-        "summary": summary,
-        "planned_links": len(plan),
-        "existing_matching_links": existing_same,
-        "status": "DRY_RUN" if args.dry_run else "PENDING",
-    }
-
     if args.dry_run:
-        logging.info("dry_run enabled; no directories or hardlinks were created.")
+        logging.info("dry_run enabled; no directories, hardlinks, or metadata files were created.")
         for item in plan[:20]:
             logging.info("[dry_run] %s -> %s", item["source"], item["target"])
         if len(plan) > 20:
             logging.info("[dry_run] ... %d more planned links omitted", len(plan) - 20)
-        if args.json_out:
-            logging.info("dry_run enabled; JSON summary is not written.")
         return 0
 
     try:
         created, already_present = create_hardlinks(plan)
+        manifest = build_manifest(
+            raw_root=raw_root,
+            out_root=out_root,
+            source_roots=source_roots,
+            summary=summary,
+            source_dir_counts=source_dir_counts,
+            leaf_counts=leaf_counts,
+            planned_links=len(plan),
+            existing_matching_links=existing_same,
+            created_links=created,
+            already_present_links=already_present,
+            status="OK",
+        )
+        write_metadata(out_root, manifest, allow_overwrite=args.resume, extra_json_out=args.json_out)
     except Exception as exc:
         logging.error("%s", exc)
         return 1
 
-    output["created_links"] = created
-    output["already_present_links"] = already_present
-    output["status"] = "OK"
     logging.info("Created hardlinks: %d", created)
     logging.info("Already-present matching hardlinks: %d", already_present)
     logging.info("FSD GenImage layout built at: %s", out_root)
-
-    if args.json_out:
-        json_path = Path(args.json_out).expanduser()
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        json_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
-        logging.info("JSON summary written: %s", json_path)
-
     return 0
 
 
