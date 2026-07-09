@@ -17,8 +17,8 @@ from PIL import Image
 from tqdm import tqdm
 
 
-DEFAULT_SRC = r"D:\data\GenImage\GenImage"
-DEFAULT_DST = r"D:\data\GenImage_resize256"
+DEFAULT_SRC = "/root/autodl-tmp/GenImage"
+DEFAULT_DST = "/root/autodl-tmp/GenImage_resize256"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 LOG_NAME = "preprocess_resize256_log.json"
 

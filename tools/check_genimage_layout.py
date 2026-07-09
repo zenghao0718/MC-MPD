@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 
-DEFAULT_ROOT = r"D:\data\GenImage\GenImage"
+DEFAULT_ROOT = "/root/autodl-tmp/GenImage"
 AI_CLASSES = ("ADM", "BigGAN", "glide", "Midjourney", "SD", "VQDM")
 REAL_CLASS = "real"
 ALL_CLASSES = (*AI_CLASSES, REAL_CLASS)
