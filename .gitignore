@@ -193,3 +193,6 @@ __pycache__/
 *.tar
 *.tar.gz
 *.7z
+
+# Cursor IDE local config
+.cursor/
