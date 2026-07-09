@@ -62,35 +62,29 @@ class ImagePathDataset(Dataset):
         return image, 0
 
 
-def make_train_transform(skip_resize: bool = False):
-    ops = []
-    if not skip_resize:
-        ops.append(transforms.Resize(256))
-    ops.extend(
+def make_train_transform():
+    return transforms.Compose(
         [
+            transforms.Resize(256),
             transforms.RandomCrop(224),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
         ]
     )
-    return transforms.Compose(ops)
 
 
-def make_eval_transform(skip_resize: bool = False):
-    ops = []
-    if not skip_resize:
-        ops.append(transforms.Resize(256))
-    ops.extend(
+def make_eval_transform():
+    return transforms.Compose(
         [
+            transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
         ]
     )
-    return transforms.Compose(ops)
 
 
-def make_stats_transform(skip_resize: bool = False):
-    return make_eval_transform(skip_resize=skip_resize)
+def make_stats_transform():
+    return make_eval_transform()
 
 
 def setup_ddfsd_infinite_train_dataloader(
@@ -99,9 +93,8 @@ def setup_ddfsd_infinite_train_dataloader(
     num_workers: int = 8,
     pin_memory: bool = True,
     drop_last: bool = True,
-    skip_resize: bool = False,
 ):
-    dataset = ImagePathDataset(folder_path, transform=make_train_transform(skip_resize=skip_resize))
+    dataset = ImagePathDataset(folder_path, transform=make_train_transform())
     sampler = DistributedSampler(dataset) if dist.is_available() and dist.is_initialized() else None
     loader = DataLoader(
         dataset,
@@ -126,13 +119,12 @@ def load_ddfsd_class_dataset(
     class_name: str,
     split: str,
     transform=None,
-    skip_resize: bool = False,
 ) -> ImagePathDataset:
     validate_generator_name(class_name, allow_real=True)
     if split not in {"train", "val"}:
         raise ValueError(f"DDFSD uses only train/val splits, got: {split}")
     if transform is None:
-        transform = make_eval_transform(skip_resize=skip_resize)
+        transform = make_eval_transform()
     return ImagePathDataset(os.path.join(data_root, class_name, split), transform=transform)
 
 
@@ -180,7 +172,6 @@ def build_train_iterators(
     images_per_class_per_step: int,
     num_workers: int,
     pin_memory: bool = True,
-    skip_resize: bool = False,
 ):
     return {
         class_name: setup_ddfsd_infinite_train_dataloader(
@@ -189,7 +180,6 @@ def build_train_iterators(
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=True,
-            skip_resize=skip_resize,
         )
         for class_name in classes
     }

@@ -31,13 +31,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_fp16", type=str2bool, default=True)
     parser.add_argument("--pretrained", type=str2bool, default=False)
-    parser.add_argument(
-        "--skip_resize",
-        type=str2bool,
-        default=False,
-        help="Skip transforms.Resize(256) for datasets already pre-resized to 256.",
-    )
-
     parser.add_argument("--exclude_class", type=str, default="ADM")
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--ckpt_step", type=int, default=0)
@@ -100,7 +93,6 @@ def main():
         )
 
     logger.setup(log_dir=args.output_dir, device=None)
-    logger.info("skip_resize=%s (True skips transforms.Resize(256) for pre-resized data)", args.skip_resize)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stats = load_frequency_stats(args.freq_stats_path)
     model = DDFSDDualDomainNet(pretrained=args.pretrained)
@@ -131,7 +123,6 @@ def main():
             tau=args.tau,
             tau_r=args.tau_r,
             max_query_per_class=args.max_eval_query_per_class,
-            skip_resize=args.skip_resize,
         )
         row = {
             "exclude_class": args.exclude_class,

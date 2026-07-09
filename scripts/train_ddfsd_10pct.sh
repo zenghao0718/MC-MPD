@@ -7,7 +7,6 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 SEED=${SEED:-42}
 EXCLUDE_CLASS=${EXCLUDE_CLASS:-ADM}
 DATA_ROOT=${DATA_ROOT:-"/root/autodl-tmp/data"}
-SKIP_RESIZE=${SKIP_RESIZE:-False}
 RUN_ROOT=${RUN_ROOT:-"/root/autodl-tmp/runs/exp-ddfsd-dual-domain-margin-v1"}
 OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/ddfsd_10pct_steps15000/exclude_${EXCLUDE_CLASS}"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"${OUTPUT_PATH}/freq_stats.pt"}
@@ -71,5 +70,4 @@ OMP_NUM_THREADS=1 torchrun --nproc_per_node 1 --nnodes 1 train_ddfsd.py \
     --freq_stats_path "${FREQ_STATS_PATH}" \
     --auto_compute_freq_stats True \
     --use_fp16 True \
-    --pretrained True \
-    --skip_resize "${SKIP_RESIZE}"
+    --pretrained True

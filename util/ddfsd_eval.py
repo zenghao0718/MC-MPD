@@ -52,13 +52,12 @@ def evaluate_binary_few_shot(
     tau: float,
     tau_r: float,
     max_query_per_class: int = 0,
-    skip_resize: bool = False,
 ) -> Dict[str, float]:
     """Evaluate real-vs-fake with fixed support and remaining val images as query."""
 
     model.eval()
-    real_dataset = load_ddfsd_class_dataset(data_root, "real", "val", skip_resize=skip_resize)
-    fake_dataset = load_ddfsd_class_dataset(data_root, fake_class, "val", skip_resize=skip_resize)
+    real_dataset = load_ddfsd_class_dataset(data_root, "real", "val")
+    fake_dataset = load_ddfsd_class_dataset(data_root, fake_class, "val")
     max_query = max_query_per_class if max_query_per_class > 0 else None
 
     real_support_idx, real_query_idx = sample_support_query_indices(
