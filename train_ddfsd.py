@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_fp16", type=str2bool, default=True)
     parser.add_argument("--pretrained", type=str2bool, default=True)
+    parser.add_argument(
+        "--skip_resize",
+        type=str2bool,
+        default=False,
+        help="Skip transforms.Resize(256) for datasets already pre-resized to 256.",
+    )
 
     parser.add_argument("--exclude_class", type=str, default="ADM")
     parser.add_argument("--batch_size", type=int, default=16, help="Episode batch size.")
@@ -176,6 +182,7 @@ def prepare_frequency_stats(args):
             batch_size=args.freq_stats_batch_size,
             num_workers=args.num_workers,
             device=torch.device("cuda", args.local_rank),
+            skip_resize=args.skip_resize,
         )
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -218,6 +225,7 @@ def run_validation(model, args, step, tb_writer):
                 tau=args.tau,
                 tau_r=args.tau_r,
                 max_query_per_class=args.max_eval_query_per_class,
+                skip_resize=args.skip_resize,
             )
             metrics_per_repeat.append(metrics)
 
@@ -249,6 +257,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.setup(log_dir=args.output_dir, device=args.device)
+    logger.info("skip_resize=%s (True skips transforms.Resize(256) for pre-resized data)", args.skip_resize)
     tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tb")) if is_main_process() else None
 
     stats = prepare_frequency_stats(args)
@@ -264,6 +273,7 @@ def main():
         images_per_class_per_step=images_per_class,
         num_workers=args.num_workers,
         pin_memory=True,
+        skip_resize=args.skip_resize,
     )
 
     model = DDFSDDualDomainNet(pretrained=args.pretrained)

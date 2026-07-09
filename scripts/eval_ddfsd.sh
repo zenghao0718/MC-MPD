@@ -7,6 +7,7 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 SEED=${SEED:-42}
 EXCLUDE_CLASS=${EXCLUDE_CLASS:-ADM}
 DATA_ROOT=${DATA_ROOT:-"/root/autodl-tmp/data"}
+SKIP_RESIZE=${SKIP_RESIZE:-False}
 RUN_ROOT=${RUN_ROOT:-"/root/autodl-tmp/runs/exp-ddfsd-dual-domain-margin-v1"}
 OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/ddfsd_10pct_steps15000/exclude_${EXCLUDE_CLASS}"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"${OUTPUT_PATH}/freq_stats.pt"}
@@ -48,4 +49,5 @@ python test_ddfsd.py \
     --tau 0.2 \
     --tau_r 0.1 \
     --use_fp16 True \
-    --pretrained False
+    --pretrained False \
+    --skip_resize "${SKIP_RESIZE}"

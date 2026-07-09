@@ -131,6 +131,7 @@ def compute_frequency_stats(
     num_workers: int = 8,
     device: Optional[torch.device] = None,
     fake_classes: Iterable[str] = FAKE_CLASSES,
+    skip_resize: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Compute and save train-split stats for real + non-excluded fake classes."""
 
@@ -138,7 +139,7 @@ def compute_frequency_stats(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     classes = ["real"] + [name for name in fake_classes if name != exclude_class]
-    transform = make_stats_transform()
+    transform = make_stats_transform(skip_resize=skip_resize)
     total_sum = torch.zeros(3, dtype=torch.float64, device=device)
     total_sq_sum = torch.zeros(3, dtype=torch.float64, device=device)
     total_count = 0
