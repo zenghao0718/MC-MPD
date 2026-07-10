@@ -45,10 +45,6 @@ TRAIN_KEYS = (
     "branch_mode_rgb_ratio",
     "branch_mode_freq_ratio",
     "lambda_sep_current",
-    "lr_group_0",
-    "lr_group_1",
-    "lr_group_2",
-    "lr_group_3",
     "step",
 )
 
@@ -69,22 +65,9 @@ OUT_FIELDS = [
     "sigma_freq_mean",
     "sigma_diff_mean",
     "lambda_sep_current",
-    "learning_rate",
-    "lr_group_0",
-    "lr_group_1",
-    "lr_group_2",
-    "lr_group_3",
     "branch_mode",
     "log_source",
 ]
-
-LR_GROUP_LABELS = (
-    ("lr_group_0", "rgb_backbone"),
-    ("lr_group_1", "freq_backbone"),
-    ("lr_group_2", "rgb_head"),
-    ("lr_group_3", "freq_head"),
-)
-
 
 def parse_int_list(value: str) -> List[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
@@ -170,16 +153,6 @@ def branch_mode_label(record: Dict) -> str:
     return f"train_mixed(dual={dual_ratio:.4f},rgb={rgb_ratio:.4f},freq={freq_ratio:.4f})"
 
 
-def learning_rate_label(record: Dict) -> str:
-    """Return exact logged group LRs in optimizer parameter-group order."""
-    parts = []
-    for key, label in LR_GROUP_LABELS:
-        value = record.get(key)
-        if value is not None:
-            parts.append(f"{label}={value}")
-    return ";".join(parts) if parts else "NA"
-
-
 def find_nearest_record(
     records: List[Dict], target_step: int, max_step_delta: int = -1
 ) -> Optional[Dict]:
@@ -234,11 +207,6 @@ def main():
                     "sigma_freq_mean": "NA",
                     "sigma_diff_mean": "NA",
                     "lambda_sep_current": "NA",
-                    "learning_rate": "NA",
-                    "lr_group_0": "NA",
-                    "lr_group_1": "NA",
-                    "lr_group_2": "NA",
-                    "lr_group_3": "NA",
                     "branch_mode": "NA",
                     "log_source": log_path,
                 }
@@ -264,11 +232,6 @@ def main():
                 "sigma_freq_mean": "NA",
                 "sigma_diff_mean": "NA",
                 "lambda_sep_current": record.get("lambda_sep_current", "NA"),
-                "learning_rate": learning_rate_label(record),
-                "lr_group_0": record.get("lr_group_0", "NA"),
-                "lr_group_1": record.get("lr_group_1", "NA"),
-                "lr_group_2": record.get("lr_group_2", "NA"),
-                "lr_group_3": record.get("lr_group_3", "NA"),
                 "branch_mode": branch_mode_label(record),
                 "log_source": log_path,
             }

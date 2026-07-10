@@ -502,21 +502,11 @@ def main():
 
             logger.logkv("step", step)
             logger.logkv("effective_step", effective_step)
-            current_lrs = scheduler.get_last_lr()
-            for idx, lr in enumerate(current_lrs):
-                # Keep the exact per-parameter-group learning rates in the
-                # DEBUG log as well as TensorBoard so read-only result tools
-                # can report them without loading checkpoints or guessing
-                # from scheduler settings.
-                logger.logkv(f"lr_group_{idx}", lr)
             kvs = logger.dumpkvs()
             for key, value in kvs.items():
-                # Learning-rate tags are written by the dedicated loop below,
-                # preserving the existing TensorBoard behavior without
-                # emitting duplicate events at the same step.
-                if not key.startswith("lr_group_") and isinstance(value, (int, float)):
+                if isinstance(value, (int, float)):
                     tb_writer.add_scalar(f"train/{key}", value, step)
-            for idx, lr in enumerate(current_lrs):
+            for idx, lr in enumerate(scheduler.get_last_lr()):
                 tb_writer.add_scalar(f"train/lr_group_{idx}", lr, step)
 
         if is_main_process() and step % args.save_interval == 0:

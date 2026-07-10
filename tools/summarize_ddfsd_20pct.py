@@ -182,7 +182,6 @@ SUMMARY_FIELDS = [
     "loss_ff",
     "loss_sep",
     "lambda_sep_current",
-    "learning_rate",
     "loss_dual",
     "loss_total",
     "selection",
@@ -336,24 +335,6 @@ def adaptive_display(row: Dict[str, str]) -> str:
     if value is None:
         return "adaptive（adaptive具体数值缺失）"
     return f"adaptive（{value:.4f}）"
-
-
-def learning_rate_value(row: Dict[str, str]) -> str:
-    for key in ("learning_rate", "lr"):
-        text = str(row.get(key, "")).strip()
-        if text and text.upper() not in {"NA", "N/A", "NONE", "NULL"} and text != MISSING:
-            # ``learning_rate`` may be either one numeric value or the exact
-            # semicolon-separated per-group label emitted by the generic log
-            # parser.  Preserve either representation verbatim.
-            return text
-    group_values = []
-    for index in range(8):
-        key = f"lr_group_{index}"
-        if to_float(row.get(key)) is not None:
-            group_values.append(f"{key}={row[key]}")
-    if group_values:
-        return ";".join(group_values)
-    return "缺失（源 CSV 未记录）"
 
 
 def read_csv_file(path: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
@@ -1020,8 +1001,6 @@ def build_completeness(data: ClassData) -> List[Dict[str, str]]:
         for key in required_train_fields:
             if to_float(row.get(key)) is None:
                 missing_values.append(f"step{step}:{key}")
-        if learning_rate_value(row).startswith("缺失"):
-            missing_values.append(f"step{step}:learning_rate")
     train_count = len(train_observed & train_expected)
     train_status = set_status(train_count, len(train_expected))
     if train_status == "完整" and missing_values:
@@ -1402,7 +1381,7 @@ def train_table(data: ClassData) -> str:
     for step in CHECKPOINT_STEPS:
         row = by_step.get(step)
         if row is None:
-            rows.append((step,) + (MISSING,) * 11)
+            rows.append((step,) + (MISSING,) * 10)
             continue
         rows.append(
             (
@@ -1415,7 +1394,6 @@ def train_table(data: ClassData) -> str:
                 fmt(row.get("loss_ff"), 6),
                 fmt(row.get("loss_sep"), 6),
                 fmt(row.get("lambda_sep_current"), 6),
-                learning_rate_value(row),
                 fmt(row.get("loss_dual"), 6),
                 fmt(row.get("loss_total"), 6),
             )
@@ -1431,7 +1409,6 @@ def train_table(data: ClassData) -> str:
             "loss_ff",
             "loss_sep",
             "lambda_sep_current",
-            "learning_rate",
             "loss_dual",
             "loss_total",
         ),
@@ -1556,8 +1533,6 @@ def build_per_class_markdown(data: ClassData, data_root: str) -> str:
 
 {train_table(data)}
 
-`learning_rate` 仅使用训练统计 CSV 中实际存在的 `learning_rate`、`lr` 或 `lr_group_N` 字段；源 CSV 未记录时写 `缺失（源 CSV 未记录）`，不按调度配置反推。
-
 ## 7. step25000 与 step30000 最终候选比较
 
 {final_comparison_table(data)}
@@ -1620,8 +1595,6 @@ def summary_row(record_type: str, data: ClassData, source: Dict[str, str]) -> Di
     }
     for output_key, source_key in mapping.items():
         row[output_key] = str(source.get(source_key, ""))
-    if record_type == "train_alpha_loss":
-        row["learning_rate"] = learning_rate_value(source)
     if "alpha_mode" in source:
         raw_mode = normalize_alpha_mode(source.get("alpha_mode"))
         row["alpha_mode_raw"] = raw_mode
@@ -1970,7 +1943,7 @@ def all_train_table(class_data: Sequence[ClassData]) -> str:
         for step in CHECKPOINT_STEPS:
             row = by_step.get(step)
             if row is None:
-                rows.append((data.exclude_class, step) + (MISSING,) * 9)
+                rows.append((data.exclude_class, step) + (MISSING,) * 8)
             else:
                 rows.append(
                     (
@@ -1983,7 +1956,6 @@ def all_train_table(class_data: Sequence[ClassData]) -> str:
                         fmt(row.get("loss_ff"), 6),
                         fmt(row.get("loss_sep"), 6),
                         fmt(row.get("lambda_sep_current"), 6),
-                        learning_rate_value(row),
                         row.get("matched_train_step", MISSING) or MISSING,
                     )
                 )
@@ -1998,7 +1970,6 @@ def all_train_table(class_data: Sequence[ClassData]) -> str:
             "loss_ff",
             "loss_sep",
             "lambda_sep_current",
-            "learning_rate",
             "matched_train_step",
         ),
         rows,
@@ -2147,7 +2118,7 @@ adaptive 行均显示测试期实测 alpha；若源 CSV 缺少该值则明确写
 
 {all_train_table(class_data)}
 
-训练期 alpha 与测试期 adaptive alpha 是不同阶段的数据，不混用。`learning_rate` 不从调度配置反推，源 CSV 未记录即写缺失。
+训练期 alpha 与测试期 adaptive alpha 是不同阶段的数据，不混用。
 
 ## 10. 类别总体均值
 

@@ -185,29 +185,6 @@ def alpha_mode(value):
     return f"{number:g}"
 
 
-def learning_rate_valid(value):
-    token = str(value).strip()
-    if not token or token.upper() in {"NA", "N/A", "NONE", "MISSING"} or "缺失" in token:
-        return False
-    try:
-        return math.isfinite(float(token))
-    except ValueError:
-        pass
-    parts = [part.strip() for part in token.split(";") if part.strip()]
-    if not parts:
-        return False
-    for part in parts:
-        if "=" not in part:
-            return False
-        _, raw_value = part.rsplit("=", 1)
-        try:
-            if not math.isfinite(float(raw_value)):
-                return False
-        except ValueError:
-            return False
-    return True
-
-
 try:
     with open(path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -227,7 +204,7 @@ required_by_kind = {
     "branch_summary": common | {"branch_mode", "support_shot", "acc_mean", "acc_std", "ap_mean", "ap_std", "eval_seeds"},
     "alpha_per_seed": common | {"branch_mode", "alpha_mode", "seed", "support_shot", "split", "acc", "ap", "adaptive_alpha_mean"},
     "alpha_summary": common | {"branch_mode", "alpha_mode", "support_shot", "acc_mean", "acc_std", "ap_mean", "ap_std", "eval_seeds", "adaptive_alpha_mean"},
-    "train": common | {"matched_train_step", "step_delta", "alpha_mean", "alpha_min", "alpha_max", "loss_rf", "loss_ff", "loss_sep", "lambda_sep_current", "learning_rate"},
+    "train": common | {"matched_train_step", "step_delta", "alpha_mean", "alpha_min", "alpha_max", "loss_rf", "loss_ff", "loss_sep", "lambda_sep_current"},
 }
 if kind not in required_by_kind:
     fail(f"unknown CSV kind: {kind}")
@@ -251,8 +228,6 @@ for row_index, row in enumerate(rows, start=2):
             fail(f"row {row_index} checkpoint/matched step mismatch: {step}/{matched}, delta={delta}")
         for field in ("alpha_mean", "alpha_min", "alpha_max", "loss_rf", "loss_ff", "loss_sep", "lambda_sep_current"):
             finite(row.get(field), f"row {row_index} {field}")
-        if not learning_rate_valid(row.get("learning_rate")):
-            fail(f"row {row_index} learning_rate is missing or invalid: {row.get('learning_rate')!r}")
         actual_keys.append((step,))
         continue
 
