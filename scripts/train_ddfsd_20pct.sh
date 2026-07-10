@@ -6,9 +6,10 @@ export HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 NUM_WORKERS=${NUM_WORKERS:-8}
 SEED=${SEED:-42}
 EXCLUDE_CLASS=${EXCLUDE_CLASS:-ADM}
-DATA_ROOT=${DATA_ROOT:-"/root/autodl-tmp/data_20pct"}
+DATA_ROOT=${DATA_ROOT:-"/root/autodl-tmp/data_fsd_20pct/GenImage"}
 RUN_ROOT=${RUN_ROOT:-"/root/autodl-tmp/runs/exp-ddfsd-dual-domain-margin-v1"}
-OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/ddfsd_20pct_steps30000/exclude_${EXCLUDE_CLASS}"}
+RUN_CONFIG=${RUN_CONFIG:-"ddfsd_20pct_steps30000"}
+OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/${RUN_CONFIG}/exclude_${EXCLUDE_CLASS}"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"${OUTPUT_PATH}/freq_stats.pt"}
 BATCH_SIZE=${BATCH_SIZE:-16}
 
@@ -25,9 +26,26 @@ RGB_HEAD_LR=${RGB_HEAD_LR:-1e-4}
 FREQ_HEAD_LR=${FREQ_HEAD_LR:-1e-4}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 
+# Keep the established 1/5 model defaults while allowing the pipeline to record
+# and explicitly pass an overridden value when a controlled follow-up run needs it.
+TAU=${TAU:-0.2}
+TAU_R=${TAU_R:-0.1}
+M_RF=${M_RF:-1.2}
+M_FF=${M_FF:-0.6}
+LAMBDA_FF=${LAMBDA_FF:-0.5}
+LAMBDA_SEP_TARGET=${LAMBDA_SEP_TARGET:-0.03}
+LAMBDA_SEP_WARMUP_START=${LAMBDA_SEP_WARMUP_START:-5000}
+LAMBDA_SEP_WARMUP_END=${LAMBDA_SEP_WARMUP_END:-15000}
+BRANCH_DROPOUT_DUAL_PROB=${BRANCH_DROPOUT_DUAL_PROB:-0.90}
+BRANCH_DROPOUT_RGB_PROB=${BRANCH_DROPOUT_RGB_PROB:-0.05}
+BRANCH_DROPOUT_FREQ_PROB=${BRANCH_DROPOUT_FREQ_PROB:-0.05}
+AUTO_COMPUTE_FREQ_STATS=${AUTO_COMPUTE_FREQ_STATS:-True}
+USE_FP16=${USE_FP16:-True}
+PRETRAINED=${PRETRAINED:-True}
+
 if [[ ! -d "${DATA_ROOT}" ]]; then
     echo "DATA_ROOT does not exist: ${DATA_ROOT}" >&2
-    echo "Set DATA_ROOT to the real 1/5 GenImage root, for example: DATA_ROOT=/path/to/data_20pct ${0}" >&2
+    echo "Set DATA_ROOT to the real 1/5 GenImage root (default: /root/autodl-tmp/data_fsd_20pct/GenImage)." >&2
     exit 1
 fi
 
@@ -56,18 +74,18 @@ OMP_NUM_THREADS=1 torchrun --nproc_per_node 1 --nnodes 1 train_ddfsd.py \
     --rgb_head_lr "${RGB_HEAD_LR}" \
     --freq_head_lr "${FREQ_HEAD_LR}" \
     --weight_decay "${WEIGHT_DECAY}" \
-    --tau 0.2 \
-    --tau_r 0.1 \
-    --m_rf 1.2 \
-    --m_ff 0.6 \
-    --lambda_ff 0.5 \
-    --lambda_sep_target 0.03 \
-    --lambda_sep_warmup_start 5000 \
-    --lambda_sep_warmup_end 15000 \
-    --branch_dropout_dual_prob 0.90 \
-    --branch_dropout_rgb_prob 0.05 \
-    --branch_dropout_freq_prob 0.05 \
+    --tau "${TAU}" \
+    --tau_r "${TAU_R}" \
+    --m_rf "${M_RF}" \
+    --m_ff "${M_FF}" \
+    --lambda_ff "${LAMBDA_FF}" \
+    --lambda_sep_target "${LAMBDA_SEP_TARGET}" \
+    --lambda_sep_warmup_start "${LAMBDA_SEP_WARMUP_START}" \
+    --lambda_sep_warmup_end "${LAMBDA_SEP_WARMUP_END}" \
+    --branch_dropout_dual_prob "${BRANCH_DROPOUT_DUAL_PROB}" \
+    --branch_dropout_rgb_prob "${BRANCH_DROPOUT_RGB_PROB}" \
+    --branch_dropout_freq_prob "${BRANCH_DROPOUT_FREQ_PROB}" \
     --freq_stats_path "${FREQ_STATS_PATH}" \
-    --auto_compute_freq_stats True \
-    --use_fp16 True \
-    --pretrained True
+    --auto_compute_freq_stats "${AUTO_COMPUTE_FREQ_STATS}" \
+    --use_fp16 "${USE_FP16}" \
+    --pretrained "${PRETRAINED}"

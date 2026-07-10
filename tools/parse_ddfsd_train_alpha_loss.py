@@ -45,6 +45,10 @@ TRAIN_KEYS = (
     "branch_mode_rgb_ratio",
     "branch_mode_freq_ratio",
     "lambda_sep_current",
+    "lr_group_0",
+    "lr_group_1",
+    "lr_group_2",
+    "lr_group_3",
     "step",
 )
 
@@ -65,9 +69,21 @@ OUT_FIELDS = [
     "sigma_freq_mean",
     "sigma_diff_mean",
     "lambda_sep_current",
+    "learning_rate",
+    "lr_group_0",
+    "lr_group_1",
+    "lr_group_2",
+    "lr_group_3",
     "branch_mode",
     "log_source",
 ]
+
+LR_GROUP_LABELS = (
+    ("lr_group_0", "rgb_backbone"),
+    ("lr_group_1", "freq_backbone"),
+    ("lr_group_2", "rgb_head"),
+    ("lr_group_3", "freq_head"),
+)
 
 
 def parse_int_list(value: str) -> List[int]:
@@ -82,6 +98,15 @@ def parse_args():
     parser.add_argument("--output_path", type=str, required=True, help="<RUN_ROOT>/.../exclude_<CLASS> directory")
     parser.add_argument("--log_path", type=str, default="", help="Explicit log file. Auto-discovered under <output_path>/logs/ if omitted.")
     parser.add_argument("--ckpt_steps", type=str, default="2500,5000,7500,10000,12500,15000")
+    parser.add_argument(
+        "--max_step_delta",
+        type=int,
+        default=-1,
+        help=(
+            "Maximum allowed distance between a checkpoint and its matched log step. "
+            "Use 0 to require an exact record; negative keeps the legacy unlimited-nearest behavior."
+        ),
+    )
     parser.add_argument("--out_csv", type=str, required=True)
     return parser.parse_args()
 
@@ -110,6 +135,10 @@ def discover_log_file(output_path: str, exclude_class: str) -> Tuple[str, List[D
     tee_log = os.path.join(output_path, "logs", f"train_{exclude_class}_10pct.log")
     if os.path.exists(tee_log):
         candidates.append(tee_log)
+
+    # Keep the legacy exact candidate above, while also accepting experiment
+    # suffixes such as ``20pct`` without hard-coding every future variant.
+    candidates.extend(sorted(glob.glob(os.path.join(output_path, "logs", f"train_{exclude_class}_*.log"))))
 
     candidates.extend(sorted(glob.glob(os.path.join(output_path, "logs", "*_log.txt"))))
     candidates.extend(sorted(glob.glob(os.path.join(output_path, "*.log"))))
@@ -141,7 +170,19 @@ def branch_mode_label(record: Dict) -> str:
     return f"train_mixed(dual={dual_ratio:.4f},rgb={rgb_ratio:.4f},freq={freq_ratio:.4f})"
 
 
-def find_nearest_record(records: List[Dict], target_step: int) -> Optional[Dict]:
+def learning_rate_label(record: Dict) -> str:
+    """Return exact logged group LRs in optimizer parameter-group order."""
+    parts = []
+    for key, label in LR_GROUP_LABELS:
+        value = record.get(key)
+        if value is not None:
+            parts.append(f"{label}={value}")
+    return ";".join(parts) if parts else "NA"
+
+
+def find_nearest_record(
+    records: List[Dict], target_step: int, max_step_delta: int = -1
+) -> Optional[Dict]:
     if not records:
         return None
     best_record = None
@@ -152,6 +193,8 @@ def find_nearest_record(records: List[Dict], target_step: int) -> Optional[Dict]
         if best_delta is None or delta < best_delta or (delta == best_delta and step < best_record["step"]):
             best_delta = delta
             best_record = record
+    if max_step_delta >= 0 and best_delta is not None and best_delta > max_step_delta:
+        return None
     return best_record
 
 
@@ -171,7 +214,7 @@ def main():
 
     rows = []
     for ckpt_step in ckpt_steps:
-        record = find_nearest_record(records, ckpt_step)
+        record = find_nearest_record(records, ckpt_step, args.max_step_delta)
         if record is None:
             rows.append(
                 {
@@ -191,6 +234,11 @@ def main():
                     "sigma_freq_mean": "NA",
                     "sigma_diff_mean": "NA",
                     "lambda_sep_current": "NA",
+                    "learning_rate": "NA",
+                    "lr_group_0": "NA",
+                    "lr_group_1": "NA",
+                    "lr_group_2": "NA",
+                    "lr_group_3": "NA",
                     "branch_mode": "NA",
                     "log_source": log_path,
                 }
@@ -216,6 +264,11 @@ def main():
                 "sigma_freq_mean": "NA",
                 "sigma_diff_mean": "NA",
                 "lambda_sep_current": record.get("lambda_sep_current", "NA"),
+                "learning_rate": learning_rate_label(record),
+                "lr_group_0": record.get("lr_group_0", "NA"),
+                "lr_group_1": record.get("lr_group_1", "NA"),
+                "lr_group_2": record.get("lr_group_2", "NA"),
+                "lr_group_3": record.get("lr_group_3", "NA"),
                 "branch_mode": branch_mode_label(record),
                 "log_source": log_path,
             }
