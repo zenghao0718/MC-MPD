@@ -17,6 +17,10 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 SEED=${SEED:-42}
 OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/ddfsd_10pct_steps15000/exclude_${EXCLUDE_CLASS}"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"${OUTPUT_PATH}/freq_stats.pt"}
+# Margin hyper-parameters passthrough (defaults match train_ddfsd_10pct.sh).
+M_RF=${M_RF:-1.2}
+M_FF=${M_FF:-0.6}
+LOG_INTERVAL=${LOG_INTERVAL:-200}
 
 FORMAL_EVAL_STEPS=${FORMAL_EVAL_STEPS:-"2500,5000,7500,10000,12500,15000"}
 BRANCH_MODE_STEPS=${BRANCH_MODE_STEPS:-"2500,5000,7500,10000,12500,15000"}
@@ -35,7 +39,7 @@ echo "############################################################"
 echo "# [1/6] TRAIN exclude_class=${EXCLUDE_CLASS}"
 echo "############################################################"
 
-export DATA_ROOT RUN_ROOT NUM_WORKERS SEED EXCLUDE_CLASS OUTPUT_PATH FREQ_STATS_PATH
+export DATA_ROOT RUN_ROOT NUM_WORKERS SEED EXCLUDE_CLASS OUTPUT_PATH FREQ_STATS_PATH M_RF M_FF LOG_INTERVAL
 
 bash scripts/train_ddfsd_10pct.sh 2>&1 | tee "${OUTPUT_PATH}/logs/train_${EXCLUDE_CLASS}_10pct.log"
 TRAIN_EXIT=${PIPESTATUS[0]}
@@ -105,7 +109,7 @@ else
 fi
 
 echo "############################################################"
-echo "# [5/6] PARSE TRAINING-TIME ALPHA/LOSS BY CHECKPOINT exclude_class=${EXCLUDE_CLASS}"
+echo "# [5/7] PARSE TRAINING-TIME ALPHA/LOSS BY CHECKPOINT exclude_class=${EXCLUDE_CLASS}"
 echo "############################################################"
 python tools/parse_ddfsd_train_alpha_loss.py \
     --exclude_class "${EXCLUDE_CLASS}" \
@@ -119,10 +123,27 @@ else
     echo "train_log_parse_status=OK" >> "${STATUS_FILE}"
 fi
 
+echo "############################################################"
+echo "# [6/7] PARSE MARGIN DIAGNOSTICS (proto_rf_/proto_ff_ distances, violation rate) exclude_class=${EXCLUDE_CLASS}"
+echo "############################################################"
+python tools/parse_ddfsd_margin_diagnostics.py \
+    --exclude_class "${EXCLUDE_CLASS}" \
+    --output_path "${OUTPUT_PATH}" \
+    --log_interval "${LOG_INTERVAL}" \
+    --ckpt_steps "2500,5000,7500,10000,12500,15000" \
+    --out_csv_by_interval "${OUTPUT_PATH}/csv/ddfsd_${EXCLUDE_CLASS}_margin_diagnostics_by_log_interval.csv" \
+    --out_csv_by_ckpt "${OUTPUT_PATH}/csv/ddfsd_${EXCLUDE_CLASS}_margin_diagnostics_by_ckpt.csv" \
+    2>&1 | tee "${OUTPUT_PATH}/logs/parse_${EXCLUDE_CLASS}_margin_diagnostics.log"
+if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+    echo "margin_diagnostics_parse_status=FAILED" >> "${STATUS_FILE}"
+else
+    echo "margin_diagnostics_parse_status=OK" >> "${STATUS_FILE}"
+fi
+
 echo "pipeline_end=$(date -Iseconds)" >> "${STATUS_FILE}"
 echo "############################################################"
-echo "# [6/6] DONE with training+eval stages for exclude_class=${EXCLUDE_CLASS}"
-echo "# (per-class markdown summary is generated afterwards by tools/summarize_ddfsd_remaining4.py)"
+echo "# [7/7] DONE with training+eval stages for exclude_class=${EXCLUDE_CLASS}"
+echo "# (per-class markdown summary is generated afterwards)"
 echo "############################################################"
 cat "${STATUS_FILE}"
 exit 0
