@@ -114,6 +114,130 @@ def is_main_process() -> bool:
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
 
+_MARGIN_DIAG_EPS = 1e-12
+
+
+def new_margin_diag_window():
+    """A fresh per-log-window accumulator of detached CPU numpy samples.
+
+    Only ever fed with tensors already produced by compute_separation_loss
+    via compute_ddfsd_episode_loss, which are detach()'d before being
+    returned. Accumulating/aggregating these values does not affect
+    training: no graph is retained and nothing here feeds back into the
+    optimizer step.
+    """
+
+    return {
+        "proto_rf_rgb": [],
+        "proto_rf_freq": [],
+        "proto_rf_fused": [],
+        "alpha_rf_pair": [],
+        "proto_ff_rgb": [],
+        "proto_ff_freq": [],
+        "proto_ff_fused": [],
+        "alpha_ff_pair": [],
+    }
+
+
+def append_margin_diag_window(window, loss_out):
+    """Append one step's detached prototype-pair tensors (CPU numpy) to window."""
+
+    window["proto_rf_rgb"].append(loss_out["proto_rf_rgb_dist"].detach().cpu().numpy().reshape(-1))
+    window["proto_rf_freq"].append(loss_out["proto_rf_freq_dist"].detach().cpu().numpy().reshape(-1))
+    window["proto_rf_fused"].append(loss_out["proto_rf_fused_dist"].detach().cpu().numpy().reshape(-1))
+    window["alpha_rf_pair"].append(loss_out["alpha_rf_pair"].detach().cpu().numpy().reshape(-1))
+    window["proto_ff_rgb"].append(loss_out["proto_ff_rgb_dist"].detach().cpu().numpy().reshape(-1))
+    window["proto_ff_freq"].append(loss_out["proto_ff_freq_dist"].detach().cpu().numpy().reshape(-1))
+    window["proto_ff_fused"].append(loss_out["proto_ff_fused_dist"].detach().cpu().numpy().reshape(-1))
+    window["alpha_ff_pair"].append(loss_out["alpha_ff_pair"].detach().cpu().numpy().reshape(-1))
+
+
+def _concat_or_empty(list_of_arrays):
+    if not list_of_arrays:
+        return np.zeros(0, dtype=np.float64)
+    return np.concatenate(list_of_arrays).astype(np.float64)
+
+
+def _basic_stats(name, values):
+    if values.size == 0:
+        return {f"{name}_mean": 0.0, f"{name}_min": 0.0, f"{name}_max": 0.0}
+    return {
+        f"{name}_mean": float(np.mean(values)),
+        f"{name}_min": float(np.min(values)),
+        f"{name}_max": float(np.max(values)),
+    }
+
+
+def _percentile_stats(name, values):
+    out = {}
+    for p in (10, 25, 50, 75, 90):
+        key = f"{name}_p{p}"
+        out[key] = float(np.percentile(values, p)) if values.size > 0 else 0.0
+    return out
+
+
+def _violation_stats(prefix, fused, margin):
+    if fused.size == 0:
+        return {
+            f"{prefix}_violation_rate": 0.0,
+            f"{prefix}_violation_gap_mean": 0.0,
+            f"{prefix}_violation_gap_max": 0.0,
+        }
+    violation_mask = fused < margin
+    violation_rate = float(np.mean(violation_mask))
+    gaps = margin - fused[violation_mask]
+    if gaps.size > 0:
+        gap_mean = float(np.mean(gaps))
+        gap_max = float(np.max(gaps))
+    else:
+        gap_mean = 0.0
+        gap_max = 0.0
+    return {
+        f"{prefix}_violation_rate": violation_rate,
+        f"{prefix}_violation_gap_mean": gap_mean,
+        f"{prefix}_violation_gap_max": gap_max,
+    }
+
+
+def compute_margin_diag_window_stats(window, m_rf, m_ff):
+    """Pool all detached samples collected since the last log dump into a
+    single dict of scalar diagnostics (mean/min/max/percentiles/violation
+    rate/violation gap). Guaranteed no NaN: falls back to 0.0 when a window
+    has zero samples (should not normally happen since every training step
+    contributes exactly batch_size*2 RF and batch_size*1 FF samples).
+    """
+
+    rf_rgb = _concat_or_empty(window["proto_rf_rgb"])
+    rf_freq = _concat_or_empty(window["proto_rf_freq"])
+    rf_fused = _concat_or_empty(window["proto_rf_fused"])
+    alpha_rf = _concat_or_empty(window["alpha_rf_pair"])
+    ff_rgb = _concat_or_empty(window["proto_ff_rgb"])
+    ff_freq = _concat_or_empty(window["proto_ff_freq"])
+    ff_fused = _concat_or_empty(window["proto_ff_fused"])
+    alpha_ff = _concat_or_empty(window["alpha_ff_pair"])
+
+    out = {}
+    out.update(_basic_stats("proto_rf_rgb", rf_rgb))
+    out.update(_basic_stats("proto_rf_freq", rf_freq))
+    out.update(_basic_stats("proto_rf_fused", rf_fused))
+    out.update(_percentile_stats("proto_rf_fused", rf_fused))
+    out.update(_basic_stats("alpha_rf_pair", alpha_rf))
+
+    out.update(_basic_stats("proto_ff_rgb", ff_rgb))
+    out.update(_basic_stats("proto_ff_freq", ff_freq))
+    out.update(_basic_stats("proto_ff_fused", ff_fused))
+    out.update(_percentile_stats("proto_ff_fused", ff_fused))
+    out.update(_basic_stats("alpha_ff_pair", alpha_ff))
+
+    out.update(_violation_stats("rf", rf_fused, m_rf))
+    out.update(_violation_stats("ff", ff_fused, m_ff))
+
+    for value in out.values():
+        assert value == value, "NaN detected in margin diagnostics window stats"  # noqa: PLR0124
+
+    return out
+
+
 def create_scheduler(optimizer, args):
     if args.scheduler_type == "step":
         return StepLR(
@@ -284,6 +408,8 @@ def main():
     effective_step = 0
     optimizer.zero_grad(set_to_none=True)
     logger.info("Start DDFSD training for %d steps.", args.total_training_steps)
+    logger.info("Margin config for this run: m_rf=%.4f m_ff=%.4f lambda_ff=%.4f", args.m_rf, args.m_ff, args.lambda_ff)
+    margin_diag_window = new_margin_diag_window()
 
     for step in range(1, args.total_training_steps + 1):
         model.train()
@@ -344,6 +470,20 @@ def main():
         logger.logkv_mean("branch_mode_rgb_ratio", 1.0 if branch_mode == "rgb-only" else 0.0)
         logger.logkv_mean("branch_mode_freq_ratio", 1.0 if branch_mode == "freq-only" else 0.0)
         logger.logkv("lambda_sep_current", lambda_sep_current)
+        logger.logkv("m_rf", args.m_rf)
+        logger.logkv("m_ff", args.m_ff)
+        logger.logkv("lambda_ff", args.lambda_ff)
+
+        # --- Margin diagnostics (read-only; does not affect loss/backward) ---
+        append_margin_diag_window(margin_diag_window, loss_out)
+        weighted_loss_rf = lambda_sep_current * loss_out["loss_rf"].item()
+        weighted_loss_ff = lambda_sep_current * args.lambda_ff * loss_out["loss_ff"].item()
+        weighted_loss_sep = lambda_sep_current * loss_out["loss_sep"].item()
+        weighted_sep_to_dual_ratio = weighted_loss_sep / max(loss_out["loss_dual"].item(), _MARGIN_DIAG_EPS)
+        logger.logkv_mean("weighted_loss_rf", weighted_loss_rf)
+        logger.logkv_mean("weighted_loss_ff", weighted_loss_ff)
+        logger.logkv_mean("weighted_loss_sep", weighted_loss_sep)
+        logger.logkv_mean("weighted_sep_to_dual_ratio", weighted_sep_to_dual_ratio)
 
         if step % args.accumulation_steps == 0:
             effective_step += 1
@@ -355,6 +495,11 @@ def main():
             scheduler.step()
 
         if is_main_process() and step % args.log_interval == 0:
+            margin_diag_stats = compute_margin_diag_window_stats(margin_diag_window, args.m_rf, args.m_ff)
+            for key, value in margin_diag_stats.items():
+                logger.logkv(key, value)
+            margin_diag_window = new_margin_diag_window()
+
             logger.logkv("step", step)
             logger.logkv("effective_step", effective_step)
             kvs = logger.dumpkvs()

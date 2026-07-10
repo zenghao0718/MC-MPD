@@ -132,12 +132,29 @@ def compute_separation_loss(
     loss_rf = torch.zeros(batch_size, dtype=torch.float32, device=device)
     loss_ff = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
+    # Diagnostics-only accumulators (detached immediately; never enter the
+    # autograd graph and never influence loss_rf/loss_ff/loss_sep below).
+    proto_rf_rgb_list = []
+    proto_rf_freq_list = []
+    proto_rf_fused_list = []
+    alpha_rf_pair_list = []
+
     for fake_idx in range(1, num_classes):
         rgb_dist = torch.sqrt((proto_rgb[:, 0] - proto_rgb[:, fake_idx]).pow(2).sum(dim=-1).clamp_min(1e-12))
         freq_dist = torch.sqrt((proto_freq[:, 0] - proto_freq[:, fake_idx]).pow(2).sum(dim=-1).clamp_min(1e-12))
         alpha_ij = 0.5 * (alpha[:, 0] + alpha[:, fake_idx])
         dist = alpha_ij * rgb_dist + (1.0 - alpha_ij) * freq_dist
         loss_rf = loss_rf + F.relu(m_rf - dist).pow(2)
+
+        proto_rf_rgb_list.append(rgb_dist.detach())
+        proto_rf_freq_list.append(freq_dist.detach())
+        proto_rf_fused_list.append(dist.detach())
+        alpha_rf_pair_list.append(alpha_ij.detach())
+
+    proto_ff_rgb_list = []
+    proto_ff_freq_list = []
+    proto_ff_fused_list = []
+    alpha_ff_pair_list = []
 
     for first_idx in range(1, num_classes):
         for second_idx in range(first_idx + 1, num_classes):
@@ -151,13 +168,35 @@ def compute_separation_loss(
             dist = alpha_ij * rgb_dist + (1.0 - alpha_ij) * freq_dist
             loss_ff = loss_ff + F.relu(m_ff - dist).pow(2)
 
+            proto_ff_rgb_list.append(rgb_dist.detach())
+            proto_ff_freq_list.append(freq_dist.detach())
+            proto_ff_fused_list.append(dist.detach())
+            alpha_ff_pair_list.append(alpha_ij.detach())
+
     loss_rf_mean = loss_rf.mean()
     loss_ff_mean = loss_ff.mean()
     loss_sep = (loss_rf + lambda_ff * loss_ff).mean()
+
+    def _stack_or_empty(tensor_list):
+        if tensor_list:
+            return torch.stack(tensor_list, dim=1)
+        return torch.zeros(batch_size, 0, dtype=torch.float32, device=device)
+
     return {
         "loss_sep": loss_sep,
         "loss_rf": loss_rf_mean,
         "loss_ff": loss_ff_mean,
+        # Prototype-to-prototype distances used by the margin loss above,
+        # shape [batch_size, num_pairs]. num_pairs is 2 for RF and 1 for FF
+        # when num_classes == 3 (Real, Fake-A, Fake-B).
+        "proto_rf_rgb_dist": _stack_or_empty(proto_rf_rgb_list),
+        "proto_rf_freq_dist": _stack_or_empty(proto_rf_freq_list),
+        "proto_rf_fused_dist": _stack_or_empty(proto_rf_fused_list),
+        "alpha_rf_pair": _stack_or_empty(alpha_rf_pair_list),
+        "proto_ff_rgb_dist": _stack_or_empty(proto_ff_rgb_list),
+        "proto_ff_freq_dist": _stack_or_empty(proto_ff_freq_list),
+        "proto_ff_fused_dist": _stack_or_empty(proto_ff_fused_list),
+        "alpha_ff_pair": _stack_or_empty(alpha_ff_pair_list),
     }
 
 
@@ -226,6 +265,17 @@ def compute_ddfsd_episode_loss(
         "fused_dist": query_out["fused_dist"],
         "proto_rgb": proto_rgb,
         "proto_freq": proto_freq,
+        # Diagnostics-only prototype-pair distances/weights (all detached in
+        # compute_separation_loss; do not participate in backward and do not
+        # change loss_total/loss_dual/loss_sep/loss_rf/loss_ff above).
+        "proto_rf_rgb_dist": sep_out["proto_rf_rgb_dist"],
+        "proto_rf_freq_dist": sep_out["proto_rf_freq_dist"],
+        "proto_rf_fused_dist": sep_out["proto_rf_fused_dist"],
+        "alpha_rf_pair": sep_out["alpha_rf_pair"],
+        "proto_ff_rgb_dist": sep_out["proto_ff_rgb_dist"],
+        "proto_ff_freq_dist": sep_out["proto_ff_freq_dist"],
+        "proto_ff_fused_dist": sep_out["proto_ff_fused_dist"],
+        "alpha_ff_pair": sep_out["alpha_ff_pair"],
     }
 
 

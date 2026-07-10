@@ -25,6 +25,12 @@ RGB_HEAD_LR=${RGB_HEAD_LR:-1e-4}
 FREQ_HEAD_LR=${FREQ_HEAD_LR:-1e-4}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 
+# Margin hyper-parameters. Defaults preserve the previous formal 1/10 run
+# (m_rf=1.2, m_ff=0.6); override via env vars for margin sweeps, e.g.
+# M_RF=1.3 M_FF=0.7 bash scripts/train_ddfsd_10pct.sh
+M_RF=${M_RF:-1.2}
+M_FF=${M_FF:-0.6}
+
 if [[ ! -d "${DATA_ROOT}" ]]; then
     echo "DATA_ROOT does not exist: ${DATA_ROOT}" >&2
     echo "Set DATA_ROOT to the 1/10 GenImage root that contains real/ ADM/ BigGAN/ glide/ Midjourney/ SD/ VQDM/." >&2
@@ -58,8 +64,8 @@ OMP_NUM_THREADS=1 torchrun --nproc_per_node 1 --nnodes 1 train_ddfsd.py \
     --weight_decay "${WEIGHT_DECAY}" \
     --tau 0.2 \
     --tau_r 0.1 \
-    --m_rf 1.2 \
-    --m_ff 0.6 \
+    --m_rf "${M_RF}" \
+    --m_ff "${M_FF}" \
     --lambda_ff 0.5 \
     --lambda_sep_target 0.03 \
     --lambda_sep_warmup_start 2500 \

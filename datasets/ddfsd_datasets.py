@@ -2,6 +2,7 @@
 
 import os
 import random
+import warnings
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -43,7 +44,18 @@ def _collect_image_paths(root: str) -> List[str]:
 
 
 class ImagePathDataset(Dataset):
-    """Image dataset that treats every image under root as one class source."""
+    """Image dataset that treats every image under root as one class source.
+
+    A small number of GenImage source files are known to be corrupted/empty
+    (e.g. 0-byte PNGs shipped upstream). __getitem__ treats such files as an
+    environmental defect: it logs a one-time warning per bad path and falls
+    back to the next path in the (fixed, sorted) file list instead of
+    crashing the DataLoader worker. This does not change how indices are
+    drawn/shuffled by samplers/RNGs upstream -- only the handful of already
+    unreadable indices resolve to a different (valid) image.
+    """
+
+    _warned_bad_paths = set()
 
     def __init__(self, root: str, transform=None):
         self.root = root
@@ -53,12 +65,28 @@ class ImagePathDataset(Dataset):
     def __len__(self) -> int:
         return len(self.paths)
 
+    def _load_image(self, index: int):
+        num_paths = len(self.paths)
+        for attempt in range(num_paths):
+            candidate_index = (index + attempt) % num_paths
+            path = self.paths[candidate_index]
+            try:
+                with Image.open(path) as image:
+                    return image.convert("RGB")
+            except Exception as exc:  # noqa: BLE001 - corrupted/unreadable image file
+                if path not in ImagePathDataset._warned_bad_paths:
+                    ImagePathDataset._warned_bad_paths.add(path)
+                    warnings.warn(
+                        f"Skipping unreadable image file (treated as environmental data "
+                        f"defect, not a sampling change): {path} ({exc})"
+                    )
+                continue
+        raise RuntimeError(f"No readable image found starting from index {index} under {self.root}")
+
     def __getitem__(self, index: int):
-        path = self.paths[index]
-        with Image.open(path) as image:
-            image = image.convert("RGB")
-            if self.transform is not None:
-                image = self.transform(image)
+        image = self._load_image(index)
+        if self.transform is not None:
+            image = self.transform(image)
         return image, 0
 
 
