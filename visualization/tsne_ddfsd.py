@@ -295,11 +295,8 @@ def scatter_tsne(
     for label, class_name in enumerate(CLASS_ORDER):
         mask = labels == label
         legend_name = DISPLAY_NAMES[class_name]
-        count = class_counts[class_name]
         if class_name == exclude_class:
-            legend_name = f"{legend_name} (test, n={count})"
-        else:
-            legend_name = f"{legend_name} (n={count})"
+            legend_name = f"{legend_name} (test)"
         ax.scatter(
             tsne_xy[mask, 0],
             tsne_xy[mask, 1],

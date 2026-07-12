@@ -139,11 +139,8 @@ def scatter_subplot(ax, artifact, exclude_class: str, point_size: float, title: 
     for label, class_name in enumerate(CLASS_ORDER):
         mask = labels == label
         legend_name = DISPLAY_NAMES[class_name]
-        count = int(class_counts[label])
         if class_name == exclude_class:
-            legend_name = f"{legend_name} (test, n={count})"
-        else:
-            legend_name = f"{legend_name} (n={count})"
+            legend_name = f"{legend_name} (test)"
         ax.scatter(
             tsne_xy[mask, 0],
             tsne_xy[mask, 1],
