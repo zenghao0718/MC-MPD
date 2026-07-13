@@ -213,6 +213,12 @@ def load_checkpoint(path: str, model):
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"DDFSD checkpoint has no 'model' key: {path}")
+    model_mode = checkpoint.get("model_mode")
+    if not model_mode:
+        config = checkpoint.get("config", checkpoint.get("args", {}))
+        model_mode = config.get("model_mode", "dual") if isinstance(config, dict) else getattr(config, "model_mode", "dual")
+    if model_mode != "dual":
+        raise ValueError("Branch-mode diagnosis is only valid for dual checkpoints; use test_ddfsd.py for true single-branch checkpoints.")
     model.load_state_dict(checkpoint["model"])
     return checkpoint
 

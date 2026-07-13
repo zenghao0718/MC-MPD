@@ -15,6 +15,9 @@ from datasets.ddfsd_datasets import (
 from model.ddfsd_losses import compute_alpha, compute_prototypes, compute_query_logits, compute_support_sigmas
 
 
+VALID_MODEL_MODES = {"dual", "rgb-only", "freq-only"}
+
+
 def binary_metrics(labels: List[int], fake_scores: List[float], preds: List[int]) -> Dict[str, float]:
     labels_np = np.asarray(labels, dtype=np.int64)
     scores_np = np.asarray(fake_scores, dtype=np.float64)
@@ -31,7 +34,9 @@ def encode_batch(model, images: torch.Tensor, device: torch.device, use_fp16: bo
     autocast_enabled = use_fp16 and device.type == "cuda"
     with autocast(device_type="cuda", enabled=autocast_enabled):
         outputs = model(images)
-    return outputs["z_rgb"].float(), outputs["z_freq"].float()
+    z_rgb = outputs.get("z_rgb")
+    z_freq = outputs.get("z_freq")
+    return (z_rgb.float() if z_rgb is not None else None, z_freq.float() if z_freq is not None else None)
 
 
 def _stack_dataset_items(dataset, indices):
@@ -52,8 +57,18 @@ def evaluate_binary_few_shot(
     tau: float,
     tau_r: float,
     max_query_per_class: int = 0,
+    model_mode: str = "dual",
+    branch_mode: str = None,
 ) -> Dict[str, float]:
     """Evaluate real-vs-fake with fixed support and remaining val images as query."""
+
+    if model_mode not in VALID_MODEL_MODES:
+        raise ValueError(f"Unknown model_mode '{model_mode}', expected one of {VALID_MODEL_MODES}")
+    branch_mode = branch_mode or model_mode
+    if branch_mode not in VALID_MODEL_MODES:
+        raise ValueError(f"Unknown branch_mode '{branch_mode}', expected one of {VALID_MODEL_MODES}")
+    if model_mode != "dual" and branch_mode != model_mode:
+        raise ValueError(f"A {model_mode} checkpoint can only be evaluated with branch_mode={model_mode}.")
 
     model.eval()
     real_dataset = load_ddfsd_class_dataset(data_root, "real", "val")
@@ -75,12 +90,21 @@ def evaluate_binary_few_shot(
         dim=0,
     )
     support_rgb_flat, support_freq_flat = encode_batch(model, support_images, device, use_fp16)
-    support_rgb = support_rgb_flat.reshape(2, support_shot, -1).permute(1, 0, 2).unsqueeze(0)
-    support_freq = support_freq_flat.reshape(2, support_shot, -1).permute(1, 0, 2).unsqueeze(0)
-
-    proto_rgb, proto_freq = compute_prototypes(support_rgb, support_freq)
-    sigma_rgb, sigma_freq = compute_support_sigmas(support_rgb, support_freq, proto_rgb, proto_freq)
-    alpha = compute_alpha(sigma_rgb, sigma_freq, tau_r=tau_r)
+    support_rgb = (
+        support_rgb_flat.reshape(2, support_shot, -1).permute(1, 0, 2).unsqueeze(0)
+        if support_rgb_flat is not None
+        else None
+    )
+    support_freq = (
+        support_freq_flat.reshape(2, support_shot, -1).permute(1, 0, 2).unsqueeze(0)
+        if support_freq_flat is not None
+        else None
+    )
+    proto_rgb, proto_freq = compute_prototypes(support_rgb, support_freq, model_mode=model_mode)
+    alpha = None
+    if model_mode == "dual":
+        sigma_rgb, sigma_freq = compute_support_sigmas(support_rgb, support_freq, proto_rgb, proto_freq)
+        alpha = compute_alpha(sigma_rgb, sigma_freq, tau_r=tau_r)
 
     all_labels: List[int] = []
     all_scores: List[float] = []
@@ -100,13 +124,14 @@ def evaluate_binary_few_shot(
         for images, _ in loader:
             query_rgb, query_freq = encode_batch(model, images, device, use_fp16)
             logits = compute_query_logits(
-                query_rgb=query_rgb.unsqueeze(0),
-                query_freq=query_freq.unsqueeze(0),
+                query_rgb=query_rgb.unsqueeze(0) if query_rgb is not None else None,
+                query_freq=query_freq.unsqueeze(0) if query_freq is not None else None,
                 proto_rgb=proto_rgb,
                 proto_freq=proto_freq,
                 alpha=alpha,
                 tau=tau,
-                branch_mode="dual",
+                branch_mode=branch_mode,
+                model_mode=model_mode,
             )["logits"].squeeze(0)
             prob = logits.softmax(dim=-1)
             all_scores.extend(prob[:, 1].detach().cpu().tolist())

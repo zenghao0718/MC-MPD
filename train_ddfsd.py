@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_fp16", type=str2bool, default=True)
     parser.add_argument("--pretrained", type=str2bool, default=True)
+    parser.add_argument("--model_mode", type=str, default="dual", choices=["dual", "rgb-only", "freq-only"])
     parser.add_argument("--exclude_class", type=str, default="ADM")
     parser.add_argument("--batch_size", type=int, default=16, help="Episode batch size.")
     parser.add_argument("--num_class_train", type=int, default=3)
@@ -117,7 +118,7 @@ def is_main_process() -> bool:
 _MARGIN_DIAG_EPS = 1e-12
 
 
-def new_margin_diag_window():
+def new_margin_diag_window(model_mode="dual"):
     """A fresh per-log-window accumulator of detached CPU numpy samples.
 
     Only ever fed with tensors already produced by compute_separation_loss
@@ -127,6 +128,8 @@ def new_margin_diag_window():
     optimizer step.
     """
 
+    if model_mode != "dual":
+        return {"proto_rf_active": [], "proto_ff_active": []}
     return {
         "proto_rf_rgb": [],
         "proto_rf_freq": [],
@@ -139,8 +142,13 @@ def new_margin_diag_window():
     }
 
 
-def append_margin_diag_window(window, loss_out):
+def append_margin_diag_window(window, loss_out, model_mode="dual"):
     """Append one step's detached prototype-pair tensors (CPU numpy) to window."""
+
+    if model_mode != "dual":
+        window["proto_rf_active"].append(loss_out["proto_rf_active_dist"].detach().cpu().numpy().reshape(-1))
+        window["proto_ff_active"].append(loss_out["proto_ff_active_dist"].detach().cpu().numpy().reshape(-1))
+        return
 
     window["proto_rf_rgb"].append(loss_out["proto_rf_rgb_dist"].detach().cpu().numpy().reshape(-1))
     window["proto_rf_freq"].append(loss_out["proto_rf_freq_dist"].detach().cpu().numpy().reshape(-1))
@@ -199,13 +207,26 @@ def _violation_stats(prefix, fused, margin):
     }
 
 
-def compute_margin_diag_window_stats(window, m_rf, m_ff):
+def compute_margin_diag_window_stats(window, m_rf, m_ff, model_mode="dual"):
     """Pool all detached samples collected since the last log dump into a
     single dict of scalar diagnostics (mean/min/max/percentiles/violation
     rate/violation gap). Guaranteed no NaN: falls back to 0.0 when a window
     has zero samples (should not normally happen since every training step
     contributes exactly batch_size*2 RF and batch_size*1 FF samples).
     """
+
+    if model_mode != "dual":
+        branch_name = "rgb" if model_mode == "rgb-only" else "freq"
+        rf_active = _concat_or_empty(window["proto_rf_active"])
+        ff_active = _concat_or_empty(window["proto_ff_active"])
+        out = {}
+        out.update(_basic_stats(f"proto_rf_{branch_name}", rf_active))
+        out.update(_percentile_stats(f"proto_rf_{branch_name}", rf_active))
+        out.update(_basic_stats(f"proto_ff_{branch_name}", ff_active))
+        out.update(_percentile_stats(f"proto_ff_{branch_name}", ff_active))
+        out.update(_violation_stats("rf", rf_active, m_rf))
+        out.update(_violation_stats("ff", ff_active, m_ff))
+        return out
 
     rf_rgb = _concat_or_empty(window["proto_rf_rgb"])
     rf_freq = _concat_or_empty(window["proto_rf_freq"])
@@ -269,8 +290,9 @@ def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimiz
             "scaler": scaler.state_dict() if scaler is not None else None,
             "args": args,
             "config": vars(args),
+            "model_mode": args.model_mode,
             "exclude_class": args.exclude_class,
-            "freq_stats_path": args.freq_stats_path,
+            "freq_stats_path": args.freq_stats_path if args.model_mode != "rgb-only" else None,
         },
         save_path,
     )
@@ -313,13 +335,14 @@ def validate_args(args):
         raise ValueError("DDFSD v1 training uses exactly 5 support and 5 query samples per class.")
     if args.accumulation_steps < 1:
         raise ValueError("accumulation_steps must be >= 1.")
-    prob_sum = (
-        args.branch_dropout_dual_prob
-        + args.branch_dropout_rgb_prob
-        + args.branch_dropout_freq_prob
-    )
-    if prob_sum <= 0:
-        raise ValueError("Branch dropout probabilities must sum to a positive value.")
+    if args.model_mode == "dual":
+        prob_sum = (
+            args.branch_dropout_dual_prob
+            + args.branch_dropout_rgb_prob
+            + args.branch_dropout_freq_prob
+        )
+        if prob_sum <= 0:
+            raise ValueError("Branch dropout probabilities must sum to a positive value.")
 
 
 def run_validation(model, args, step, tb_writer):
@@ -341,6 +364,8 @@ def run_validation(model, args, step, tb_writer):
                 tau=args.tau,
                 tau_r=args.tau_r,
                 max_query_per_class=args.max_eval_query_per_class,
+                model_mode=args.model_mode,
+                branch_mode=args.model_mode,
             )
             metrics_per_repeat.append(metrics)
 
@@ -374,9 +399,13 @@ def main():
     logger.setup(log_dir=args.output_dir, device=args.device)
     tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tb")) if is_main_process() else None
 
-    stats = prepare_frequency_stats(args)
-    logger.info("Loaded frequency stats from %s", args.freq_stats_path)
-    logger.info("Frequency mean shape: %s std shape: %s", tuple(stats["mean"].shape), tuple(stats["std"].shape))
+    stats = None
+    if args.model_mode != "rgb-only":
+        stats = prepare_frequency_stats(args)
+        logger.info("Loaded frequency stats from %s", args.freq_stats_path)
+        logger.info("Frequency mean shape: %s std shape: %s", tuple(stats["mean"].shape), tuple(stats["std"].shape))
+    else:
+        logger.info("model_mode=rgb-only: skipping frequency-stat loading and computation.")
 
     images_per_class = (args.num_support_train + args.num_query_train) * args.batch_size
     train_fake_classes = get_train_fake_classes(args.exclude_class)
@@ -389,27 +418,37 @@ def main():
         pin_memory=True,
     )
 
-    model = DDFSDDualDomainNet(pretrained=args.pretrained)
-    model.set_freq_stats(stats["mean"], stats["std"])
+    model = DDFSDDualDomainNet(pretrained=args.pretrained, model_mode=args.model_mode)
+    if stats is not None:
+        model.set_freq_stats(stats["mean"], stats["std"])
     model = model.to(args.device)
 
-    optimizer = torch.optim.AdamW(
-        [
+    if args.model_mode == "dual":
+        optimizer_groups = [
             {"params": model.rgb_backbone.parameters(), "lr": args.rgb_backbone_lr},
             {"params": model.freq_backbone.parameters(), "lr": args.freq_backbone_lr},
             {"params": model.rgb_projector.parameters(), "lr": args.rgb_head_lr},
             {"params": model.freq_projector.parameters(), "lr": args.freq_head_lr},
-        ],
-        weight_decay=args.weight_decay,
-    )
+        ]
+    elif args.model_mode == "rgb-only":
+        optimizer_groups = [
+            {"params": model.rgb_backbone.parameters(), "lr": args.rgb_backbone_lr},
+            {"params": model.rgb_projector.parameters(), "lr": args.rgb_head_lr},
+        ]
+    else:
+        optimizer_groups = [
+            {"params": model.freq_backbone.parameters(), "lr": args.freq_backbone_lr},
+            {"params": model.freq_projector.parameters(), "lr": args.freq_head_lr},
+        ]
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=args.weight_decay)
     scheduler = create_scheduler(optimizer, args)
     scaler = GradScaler(enabled=args.use_fp16)
 
     effective_step = 0
     optimizer.zero_grad(set_to_none=True)
-    logger.info("Start DDFSD training for %d steps.", args.total_training_steps)
+    logger.info("Start DDFSD %s training for %d steps.", args.model_mode, args.total_training_steps)
     logger.info("Margin config for this run: m_rf=%.4f m_ff=%.4f lambda_ff=%.4f", args.m_rf, args.m_ff, args.lambda_ff)
-    margin_diag_window = new_margin_diag_window()
+    margin_diag_window = new_margin_diag_window(args.model_mode)
 
     for step in range(1, args.total_training_steps + 1):
         model.train()
@@ -425,18 +464,21 @@ def main():
             warmup_start=args.lambda_sep_warmup_start,
             warmup_end=args.lambda_sep_warmup_end,
         )
-        branch_mode = sample_branch_mode(
-            args.branch_dropout_dual_prob,
-            args.branch_dropout_rgb_prob,
-            args.branch_dropout_freq_prob,
-        )
+        if args.model_mode == "dual":
+            branch_mode = sample_branch_mode(
+                args.branch_dropout_dual_prob,
+                args.branch_dropout_rgb_prob,
+                args.branch_dropout_freq_prob,
+            )
+        else:
+            branch_mode = args.model_mode
 
         with autocast(device_type="cuda", enabled=args.use_fp16):
             outputs = model(raw_rgb)
 
         loss_out = compute_ddfsd_episode_loss(
-            z_rgb_flat=outputs["z_rgb"],
-            z_freq_flat=outputs["z_freq"],
+            z_rgb_flat=outputs.get("z_rgb"),
+            z_freq_flat=outputs.get("z_freq"),
             episode_batch_size=args.batch_size,
             num_classes=args.num_class_train,
             num_support=args.num_support_train,
@@ -448,6 +490,7 @@ def main():
             lambda_ff=args.lambda_ff,
             lambda_sep_current=lambda_sep_current,
             branch_mode=branch_mode,
+            model_mode=args.model_mode,
         )
         loss = loss_out["loss_total"]
         if not torch.isfinite(loss):
@@ -456,26 +499,31 @@ def main():
         scaler.scale(loss / args.accumulation_steps).backward()
 
         logger.logkv_mean("loss_total", loss_out["loss_total"].item())
+        logger.logkv_mean("loss_cls", loss_out["loss_cls"].item())
         logger.logkv_mean("loss_dual", loss_out["loss_dual"].item())
         logger.logkv_mean("loss_sep", loss_out["loss_sep"].item())
         logger.logkv_mean("loss_rf", loss_out["loss_rf"].item())
         logger.logkv_mean("loss_ff", loss_out["loss_ff"].item())
-        logger.logkv_mean("alpha_mean", loss_out["alpha"].mean().item())
-        logger.logkv_mean("alpha_min", loss_out["alpha"].min().item())
-        logger.logkv_mean("alpha_max", loss_out["alpha"].max().item())
-        logger.logkv_mean("rgb_dist_mean", loss_out["rgb_dist"].mean().item())
-        logger.logkv_mean("freq_dist_mean", loss_out["freq_dist"].mean().item())
-        logger.logkv_mean("fused_dist_mean", loss_out["fused_dist"].mean().item())
-        logger.logkv_mean("branch_mode_dual_ratio", 1.0 if branch_mode == "dual" else 0.0)
-        logger.logkv_mean("branch_mode_rgb_ratio", 1.0 if branch_mode == "rgb-only" else 0.0)
-        logger.logkv_mean("branch_mode_freq_ratio", 1.0 if branch_mode == "freq-only" else 0.0)
+        if loss_out["rgb_dist"] is not None:
+            logger.logkv_mean("rgb_dist_mean", loss_out["rgb_dist"].mean().item())
+        if loss_out["freq_dist"] is not None:
+            logger.logkv_mean("freq_dist_mean", loss_out["freq_dist"].mean().item())
+        if args.model_mode == "dual":
+            logger.logkv_mean("alpha_mean", loss_out["alpha"].mean().item())
+            logger.logkv_mean("alpha_min", loss_out["alpha"].min().item())
+            logger.logkv_mean("alpha_max", loss_out["alpha"].max().item())
+            logger.logkv_mean("fused_dist_mean", loss_out["fused_dist"].mean().item())
+            logger.logkv_mean("branch_mode_dual_ratio", 1.0 if branch_mode == "dual" else 0.0)
+            logger.logkv_mean("branch_mode_rgb_ratio", 1.0 if branch_mode == "rgb-only" else 0.0)
+            logger.logkv_mean("branch_mode_freq_ratio", 1.0 if branch_mode == "freq-only" else 0.0)
+        logger.logkv("model_mode", args.model_mode)
         logger.logkv("lambda_sep_current", lambda_sep_current)
         logger.logkv("m_rf", args.m_rf)
         logger.logkv("m_ff", args.m_ff)
         logger.logkv("lambda_ff", args.lambda_ff)
 
         # --- Margin diagnostics (read-only; does not affect loss/backward) ---
-        append_margin_diag_window(margin_diag_window, loss_out)
+        append_margin_diag_window(margin_diag_window, loss_out, args.model_mode)
         weighted_loss_rf = lambda_sep_current * loss_out["loss_rf"].item()
         weighted_loss_ff = lambda_sep_current * args.lambda_ff * loss_out["loss_ff"].item()
         weighted_loss_sep = lambda_sep_current * loss_out["loss_sep"].item()
@@ -495,10 +543,12 @@ def main():
             scheduler.step()
 
         if is_main_process() and step % args.log_interval == 0:
-            margin_diag_stats = compute_margin_diag_window_stats(margin_diag_window, args.m_rf, args.m_ff)
+            margin_diag_stats = compute_margin_diag_window_stats(
+                margin_diag_window, args.m_rf, args.m_ff, args.model_mode
+            )
             for key, value in margin_diag_stats.items():
                 logger.logkv(key, value)
-            margin_diag_window = new_margin_diag_window()
+            margin_diag_window = new_margin_diag_window(args.model_mode)
 
             logger.logkv("step", step)
             logger.logkv("effective_step", effective_step)

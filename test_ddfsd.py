@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument("--exclude_class", type=str, default="ADM")
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--ckpt_step", type=int, default=0)
+    parser.add_argument("--model_mode", type=str, default="auto", choices=["auto", "dual", "rgb-only", "freq-only"])
     parser.add_argument("--freq_stats_path", type=str, default="")
     parser.add_argument("--num_support_test", type=int, default=10)
     parser.add_argument("--num_query_test", type=int, default=0)
@@ -61,12 +62,32 @@ def load_runtime_dependencies():
     from util.utils import set_seed
 
 
-def load_checkpoint(path: str, model):
+def load_checkpoint(path: str):
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"DDFSD checkpoint has no 'model' key: {path}")
-    model.load_state_dict(checkpoint["model"])
     return checkpoint
+
+
+def checkpoint_model_mode(checkpoint):
+    model_mode = checkpoint.get("model_mode")
+    if model_mode:
+        return model_mode
+    config = checkpoint.get("config", checkpoint.get("args", {}))
+    if isinstance(config, dict):
+        return config.get("model_mode", "dual")
+    return getattr(config, "model_mode", "dual")
+
+
+def resolve_model_mode(requested_mode, checkpoint):
+    checkpoint_mode = checkpoint_model_mode(checkpoint)
+    if checkpoint_mode not in {"dual", "rgb-only", "freq-only"}:
+        raise ValueError(f"Checkpoint records invalid model_mode '{checkpoint_mode}'.")
+    if requested_mode != "auto" and requested_mode != checkpoint_mode:
+        raise ValueError(
+            f"--model_mode {requested_mode} conflicts with checkpoint model_mode {checkpoint_mode}."
+        )
+    return checkpoint_mode
 
 
 def write_csv(path: str, rows, fieldnames):
@@ -84,20 +105,27 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    if not args.freq_stats_path:
-        args.freq_stats_path = os.path.join(args.output_dir, "freq_stats.pt")
-    if not os.path.exists(args.freq_stats_path):
-        raise FileNotFoundError(
-            f"Missing freq_stats.pt for evaluation: {args.freq_stats_path}. "
-            "Test must not auto-compute frequency stats."
-        )
-
     logger.setup(log_dir=args.output_dir, device=None)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stats = load_frequency_stats(args.freq_stats_path)
-    model = DDFSDDualDomainNet(pretrained=args.pretrained)
-    model.set_freq_stats(stats["mean"], stats["std"])
-    checkpoint = load_checkpoint(args.ckpt_path, model)
+    checkpoint = load_checkpoint(args.ckpt_path)
+    model_mode = resolve_model_mode(args.model_mode, checkpoint)
+    stats = None
+    if model_mode != "rgb-only":
+        if not args.freq_stats_path:
+            args.freq_stats_path = os.path.join(args.output_dir, "freq_stats.pt")
+        if not os.path.exists(args.freq_stats_path):
+            raise FileNotFoundError(
+                f"Missing freq_stats.pt for evaluation: {args.freq_stats_path}. "
+                "Test must not auto-compute frequency stats."
+            )
+        stats = load_frequency_stats(args.freq_stats_path)
+    else:
+        args.freq_stats_path = ""
+
+    model = DDFSDDualDomainNet(pretrained=args.pretrained, model_mode=model_mode)
+    if stats is not None:
+        model.set_freq_stats(stats["mean"], stats["std"])
+    model.load_state_dict(checkpoint["model"])
     model = model.to(device)
     model.eval()
 
@@ -123,8 +151,12 @@ def main():
             tau=args.tau,
             tau_r=args.tau_r,
             max_query_per_class=args.max_eval_query_per_class,
+            model_mode=model_mode,
+            branch_mode=model_mode,
         )
         row = {
+            "model_mode": model_mode,
+            "branch_mode": model_mode,
             "exclude_class": args.exclude_class,
             "seed": seed,
             "support_shot": args.num_support_test,
@@ -159,6 +191,8 @@ def main():
     auc_mean, auc_std = mean_std("auc")
     summary_rows = [
         {
+            "model_mode": model_mode,
+            "branch_mode": model_mode,
             "exclude_class": args.exclude_class,
             "support_shot": args.num_support_test,
             "ckpt_step": ckpt_step,
@@ -180,6 +214,8 @@ def main():
         per_seed_path,
         per_seed_rows,
         [
+            "model_mode",
+            "branch_mode",
             "exclude_class",
             "seed",
             "support_shot",
@@ -200,6 +236,8 @@ def main():
         summary_path,
         summary_rows,
         [
+            "model_mode",
+            "branch_mode",
             "exclude_class",
             "support_shot",
             "ckpt_step",

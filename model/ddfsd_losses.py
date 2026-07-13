@@ -1,13 +1,14 @@
 """DDFSD prototype losses and distance utilities."""
 
 import random
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
 
 
 VALID_BRANCH_MODES = {"dual", "rgb-only", "freq-only"}
+VALID_MODEL_MODES = VALID_BRANCH_MODES
 
 
 def ordinary_euclidean_distance(query: torch.Tensor, proto: torch.Tensor) -> torch.Tensor:
@@ -43,11 +44,30 @@ def make_query_labels(
     return labels_one_episode.unsqueeze(0).expand(episode_batch_size, -1).reshape(-1)
 
 
-def compute_prototypes(support_rgb: torch.Tensor, support_freq: torch.Tensor):
-    support_rgb = support_rgb.float()
-    support_freq = support_freq.float()
-    proto_rgb = F.normalize(support_rgb.mean(dim=1), p=2, dim=-1)
-    proto_freq = F.normalize(support_freq.mean(dim=1), p=2, dim=-1)
+def _validate_model_mode(model_mode: str) -> None:
+    if model_mode not in VALID_MODEL_MODES:
+        raise ValueError(f"Unknown model_mode '{model_mode}', expected one of {VALID_MODEL_MODES}")
+
+
+def compute_prototypes(
+    support_rgb: Optional[torch.Tensor] = None,
+    support_freq: Optional[torch.Tensor] = None,
+    model_mode: str = "dual",
+):
+    """Build prototypes only for branches present in ``model_mode``."""
+
+    _validate_model_mode(model_mode)
+    if model_mode in {"dual", "rgb-only"} and support_rgb is None:
+        raise ValueError(f"{model_mode} prototype computation requires support_rgb.")
+    if model_mode in {"dual", "freq-only"} and support_freq is None:
+        raise ValueError(f"{model_mode} prototype computation requires support_freq.")
+
+    proto_rgb = None
+    proto_freq = None
+    if support_rgb is not None:
+        proto_rgb = F.normalize(support_rgb.float().mean(dim=1), p=2, dim=-1)
+    if support_freq is not None:
+        proto_freq = F.normalize(support_freq.float().mean(dim=1), p=2, dim=-1)
     return proto_rgb, proto_freq
 
 
@@ -91,22 +111,46 @@ def fuse_distances(
 
 
 def compute_query_logits(
-    query_rgb: torch.Tensor,
-    query_freq: torch.Tensor,
-    proto_rgb: torch.Tensor,
-    proto_freq: torch.Tensor,
-    alpha: torch.Tensor,
-    tau: float,
+    query_rgb: Optional[torch.Tensor] = None,
+    query_freq: Optional[torch.Tensor] = None,
+    proto_rgb: Optional[torch.Tensor] = None,
+    proto_freq: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
+    tau: float = 0.2,
     branch_mode: str = "dual",
-) -> Dict[str, torch.Tensor]:
-    query_rgb = query_rgb.float()
-    query_freq = query_freq.float()
-    proto_rgb = proto_rgb.float()
-    proto_freq = proto_freq.float()
-    rgb_dist = ordinary_euclidean_distance(query_rgb, proto_rgb)
-    freq_dist = ordinary_euclidean_distance(query_freq, proto_freq)
-    fused_dist = fuse_distances(rgb_dist, freq_dist, alpha, branch_mode)
-    logits = -fused_dist / tau
+    model_mode: str = "dual",
+) -> Dict[str, Optional[torch.Tensor]]:
+    """Compute logits without touching an absent branch in single-branch modes."""
+
+    _validate_model_mode(model_mode)
+    if branch_mode not in VALID_BRANCH_MODES:
+        raise ValueError(f"Unknown branch mode '{branch_mode}', expected {VALID_BRANCH_MODES}")
+    if model_mode != "dual" and branch_mode != model_mode:
+        raise ValueError(f"A {model_mode} model can only use branch_mode={model_mode}.")
+
+    rgb_dist = None
+    freq_dist = None
+    if model_mode in {"dual", "rgb-only"}:
+        if query_rgb is None or proto_rgb is None:
+            raise ValueError(f"{model_mode} logits require RGB query embeddings and prototypes.")
+        rgb_dist = ordinary_euclidean_distance(query_rgb.float(), proto_rgb.float())
+    if model_mode in {"dual", "freq-only"}:
+        if query_freq is None or proto_freq is None:
+            raise ValueError(f"{model_mode} logits require frequency query embeddings and prototypes.")
+        freq_dist = ordinary_euclidean_distance(query_freq.float(), proto_freq.float())
+
+    if model_mode == "dual":
+        if alpha is None:
+            raise ValueError("dual logits require adaptive alpha.")
+        fused_dist = fuse_distances(rgb_dist, freq_dist, alpha, branch_mode)
+        active_dist = fused_dist
+    elif model_mode == "rgb-only":
+        fused_dist = None
+        active_dist = rgb_dist
+    else:
+        fused_dist = None
+        active_dist = freq_dist
+    logits = -active_dist / tau
     return {
         "logits": logits,
         "rgb_dist": rgb_dist,
@@ -116,13 +160,62 @@ def compute_query_logits(
 
 
 def compute_separation_loss(
-    proto_rgb: torch.Tensor,
-    proto_freq: torch.Tensor,
-    alpha: torch.Tensor,
+    proto_rgb: Optional[torch.Tensor],
+    proto_freq: Optional[torch.Tensor],
+    alpha: Optional[torch.Tensor],
     m_rf: float,
     m_ff: float,
     lambda_ff: float,
-) -> Dict[str, torch.Tensor]:
+    model_mode: str = "dual",
+) -> Dict[str, Optional[torch.Tensor]]:
+    _validate_model_mode(model_mode)
+    if model_mode != "dual":
+        proto = proto_rgb if model_mode == "rgb-only" else proto_freq
+        if proto is None:
+            raise ValueError(f"{model_mode} separation loss requires its surviving prototypes.")
+        batch_size, num_classes, _ = proto.shape
+        device = proto.device
+        loss_rf = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        loss_ff = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        rf_distances = []
+        ff_distances = []
+        for fake_idx in range(1, num_classes):
+            dist = torch.sqrt((proto[:, 0] - proto[:, fake_idx]).pow(2).sum(dim=-1).clamp_min(1e-12))
+            loss_rf = loss_rf + F.relu(m_rf - dist).pow(2)
+            rf_distances.append(dist.detach())
+        for first_idx in range(1, num_classes):
+            for second_idx in range(first_idx + 1, num_classes):
+                dist = torch.sqrt(
+                    (proto[:, first_idx] - proto[:, second_idx]).pow(2).sum(dim=-1).clamp_min(1e-12)
+                )
+                loss_ff = loss_ff + F.relu(m_ff - dist).pow(2)
+                ff_distances.append(dist.detach())
+
+        def _stack_or_empty(tensor_list):
+            if tensor_list:
+                return torch.stack(tensor_list, dim=1)
+            return torch.zeros(batch_size, 0, dtype=torch.float32, device=device)
+
+        rf_active = _stack_or_empty(rf_distances)
+        ff_active = _stack_or_empty(ff_distances)
+        return {
+            "loss_sep": (loss_rf + lambda_ff * loss_ff).mean(),
+            "loss_rf": loss_rf.mean(),
+            "loss_ff": loss_ff.mean(),
+            "proto_rf_active_dist": rf_active,
+            "proto_ff_active_dist": ff_active,
+            "proto_rf_rgb_dist": rf_active if model_mode == "rgb-only" else None,
+            "proto_rf_freq_dist": rf_active if model_mode == "freq-only" else None,
+            "proto_rf_fused_dist": None,
+            "alpha_rf_pair": None,
+            "proto_ff_rgb_dist": ff_active if model_mode == "rgb-only" else None,
+            "proto_ff_freq_dist": ff_active if model_mode == "freq-only" else None,
+            "proto_ff_fused_dist": None,
+            "alpha_ff_pair": None,
+        }
+
+    if proto_rgb is None or proto_freq is None or alpha is None:
+        raise ValueError("dual separation loss requires RGB/frequency prototypes and alpha.")
     proto_rgb = proto_rgb.float()
     proto_freq = proto_freq.float()
     alpha = alpha.float().detach()
@@ -186,6 +279,8 @@ def compute_separation_loss(
         "loss_sep": loss_sep,
         "loss_rf": loss_rf_mean,
         "loss_ff": loss_ff_mean,
+        "proto_rf_active_dist": None,
+        "proto_ff_active_dist": None,
         # Prototype-to-prototype distances used by the margin loss above,
         # shape [batch_size, num_pairs]. num_pairs is 2 for RF and 1 for FF
         # when num_classes == 3 (Real, Fake-A, Fake-B).
@@ -201,8 +296,8 @@ def compute_separation_loss(
 
 
 def compute_ddfsd_episode_loss(
-    z_rgb_flat: torch.Tensor,
-    z_freq_flat: torch.Tensor,
+    z_rgb_flat: Optional[torch.Tensor],
+    z_freq_flat: Optional[torch.Tensor],
     episode_batch_size: int,
     num_classes: int,
     num_support: int,
@@ -214,19 +309,46 @@ def compute_ddfsd_episode_loss(
     lambda_ff: float,
     lambda_sep_current: float,
     branch_mode: str = "dual",
-) -> Dict[str, torch.Tensor]:
+    model_mode: str = "dual",
+) -> Dict[str, Optional[torch.Tensor]]:
+    _validate_model_mode(model_mode)
+    if model_mode != "dual" and branch_mode != model_mode:
+        raise ValueError(f"A {model_mode} model can only train with branch_mode={model_mode}.")
+    if model_mode in {"dual", "rgb-only"} and z_rgb_flat is None:
+        raise ValueError(f"{model_mode} episode loss requires z_rgb_flat.")
+    if model_mode in {"dual", "freq-only"} and z_freq_flat is None:
+        raise ValueError(f"{model_mode} episode loss requires z_freq_flat.")
+
     samples_per_class = num_support + num_query
-    z_rgb = reshape_flat_embeddings(z_rgb_flat, episode_batch_size, num_classes, samples_per_class)
-    z_freq = reshape_flat_embeddings(z_freq_flat, episode_batch_size, num_classes, samples_per_class)
+    z_rgb = (
+        reshape_flat_embeddings(z_rgb_flat, episode_batch_size, num_classes, samples_per_class)
+        if z_rgb_flat is not None
+        else None
+    )
+    z_freq = (
+        reshape_flat_embeddings(z_freq_flat, episode_batch_size, num_classes, samples_per_class)
+        if z_freq_flat is not None
+        else None
+    )
 
-    support_rgb = z_rgb[:, :num_support, :, :]
-    support_freq = z_freq[:, :num_support, :, :]
-    query_rgb = z_rgb[:, num_support:, :, :].reshape(episode_batch_size, num_query * num_classes, -1)
-    query_freq = z_freq[:, num_support:, :, :].reshape(episode_batch_size, num_query * num_classes, -1)
+    support_rgb = z_rgb[:, :num_support, :, :] if z_rgb is not None else None
+    support_freq = z_freq[:, :num_support, :, :] if z_freq is not None else None
+    query_rgb = (
+        z_rgb[:, num_support:, :, :].reshape(episode_batch_size, num_query * num_classes, -1)
+        if z_rgb is not None
+        else None
+    )
+    query_freq = (
+        z_freq[:, num_support:, :, :].reshape(episode_batch_size, num_query * num_classes, -1)
+        if z_freq is not None
+        else None
+    )
 
-    proto_rgb, proto_freq = compute_prototypes(support_rgb, support_freq)
-    sigma_rgb, sigma_freq = compute_support_sigmas(support_rgb, support_freq, proto_rgb, proto_freq)
-    alpha = compute_alpha(sigma_rgb, sigma_freq, tau_r=tau_r)
+    proto_rgb, proto_freq = compute_prototypes(support_rgb, support_freq, model_mode=model_mode)
+    alpha = None
+    if model_mode == "dual":
+        sigma_rgb, sigma_freq = compute_support_sigmas(support_rgb, support_freq, proto_rgb, proto_freq)
+        alpha = compute_alpha(sigma_rgb, sigma_freq, tau_r=tau_r)
 
     query_out = compute_query_logits(
         query_rgb=query_rgb,
@@ -236,10 +358,12 @@ def compute_ddfsd_episode_loss(
         alpha=alpha,
         tau=tau,
         branch_mode=branch_mode,
+        model_mode=model_mode,
     )
-    labels = make_query_labels(episode_batch_size, num_classes, num_query, z_rgb_flat.device)
+    device = z_rgb_flat.device if z_rgb_flat is not None else z_freq_flat.device
+    labels = make_query_labels(episode_batch_size, num_classes, num_query, device)
     logits = query_out["logits"].reshape(-1, num_classes)
-    loss_dual = F.cross_entropy(logits, labels)
+    loss_cls = F.cross_entropy(logits, labels)
 
     sep_out = compute_separation_loss(
         proto_rgb=proto_rgb,
@@ -248,12 +372,14 @@ def compute_ddfsd_episode_loss(
         m_rf=m_rf,
         m_ff=m_ff,
         lambda_ff=lambda_ff,
+        model_mode=model_mode,
     )
-    loss_total = loss_dual + float(lambda_sep_current) * sep_out["loss_sep"]
+    loss_total = loss_cls + float(lambda_sep_current) * sep_out["loss_sep"]
 
     return {
         "loss_total": loss_total.float(),
-        "loss_dual": loss_dual.float(),
+        "loss_cls": loss_cls.float(),
+        "loss_dual": loss_cls.float(),
         "loss_sep": sep_out["loss_sep"].float(),
         "loss_rf": sep_out["loss_rf"].float(),
         "loss_ff": sep_out["loss_ff"].float(),
