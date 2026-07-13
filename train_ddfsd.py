@@ -77,6 +77,18 @@ def parse_args():
     parser.add_argument("--freq_stats_path", type=str, default="")
     parser.add_argument("--auto_compute_freq_stats", type=str2bool, default=True)
     parser.add_argument("--freq_stats_batch_size", type=int, default=128)
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default="",
+        help="Checkpoint path used to resume training.",
+    )
+    parser.add_argument(
+        "--resume_strict_config",
+        type=str2bool,
+        default=True,
+        help="Whether to strictly validate resume configuration.",
+    )
 
     return parser.parse_args()
 
@@ -277,6 +289,62 @@ def create_scheduler(optimizer, args):
     return LambdaLR(optimizer=optimizer, lr_lambda=lr_lambda)
 
 
+RESUME_CONFIG_KEYS = (
+    "model", "model_mode", "exclude_class", "batch_size", "num_class_train",
+    "num_support_train", "num_query_train", "accumulation_steps", "scheduler_type",
+    "lr_scheduler_step", "lr_scheduler_gamma", "rgb_backbone_lr", "freq_backbone_lr",
+    "rgb_head_lr", "freq_head_lr", "weight_decay", "tau", "tau_r", "m_rf", "m_ff",
+    "lambda_ff", "lambda_sep_target", "lambda_sep_warmup_start", "lambda_sep_warmup_end",
+    "branch_dropout_dual_prob", "branch_dropout_rgb_prob", "branch_dropout_freq_prob",
+)
+
+
+def checkpoint_config(checkpoint):
+    config = checkpoint.get("config", checkpoint.get("args", {}))
+    return config if isinstance(config, dict) else vars(config)
+
+
+def validate_resume_config(args, checkpoint):
+    config = checkpoint_config(checkpoint)
+    mismatches = []
+    for key in RESUME_CONFIG_KEYS:
+        if key not in config:
+            mismatches.append(f"{key}: missing from checkpoint (current={getattr(args, key)!r})")
+            continue
+        old, current = config[key], getattr(args, key)
+        equal = math.isclose(old, current, rel_tol=1e-7, abs_tol=1e-12) if (
+            isinstance(old, float) and isinstance(current, (int, float))
+        ) else old == current
+        if not equal:
+            mismatches.append(f"{key}: checkpoint={old!r}, current={current!r}")
+    if mismatches:
+        raise ValueError("Resume configuration mismatch:\n  " + "\n  ".join(mismatches))
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def restore_random_states(checkpoint):
+    states = (
+        ("python_random_state", random.setstate),
+        ("numpy_random_state", np.random.set_state),
+        ("torch_cpu_rng_state", torch.set_rng_state),
+    )
+    for key, restore in states:
+        if checkpoint.get(key) is None:
+            logger.warn("Resume checkpoint has no %s; continuing without restoring it.", key)
+        else:
+            restore(checkpoint[key])
+    if checkpoint.get("torch_cuda_rng_state") is None:
+        logger.warn("Resume checkpoint has no torch_cuda_rng_state; continuing without restoring it.")
+    elif torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(checkpoint["torch_cuda_rng_state"])
+
+
 def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimizer, scheduler, scaler):
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, f"{args.model}_step[{step}].pth")
@@ -293,6 +361,13 @@ def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimiz
             "model_mode": args.model_mode,
             "exclude_class": args.exclude_class,
             "freq_stats_path": args.freq_stats_path if args.model_mode != "rgb-only" else None,
+            "resume_from_checkpoint": args.resume_checkpoint or None,
+            "resume_from_step": getattr(args, "resume_from_step", 0),
+            "resume_target_total_steps": args.total_training_steps,
+            "python_random_state": random.getstate(),
+            "numpy_random_state": np.random.get_state(),
+            "torch_cpu_rng_state": torch.get_rng_state(),
+            "torch_cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
         save_path,
     )
@@ -418,7 +493,8 @@ def main():
         pin_memory=True,
     )
 
-    model = DDFSDDualDomainNet(pretrained=args.pretrained, model_mode=args.model_mode)
+    model_pretrained = args.pretrained and not bool(args.resume_checkpoint)
+    model = DDFSDDualDomainNet(pretrained=model_pretrained, model_mode=args.model_mode)
     if stats is not None:
         model.set_freq_stats(stats["mean"], stats["std"])
     model = model.to(args.device)
@@ -444,13 +520,55 @@ def main():
     scheduler = create_scheduler(optimizer, args)
     scaler = GradScaler(enabled=args.use_fp16)
 
+    start_step = 1
     effective_step = 0
+    args.resume_from_step = 0
+    if args.resume_checkpoint:
+        if not os.path.isfile(args.resume_checkpoint):
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {args.resume_checkpoint}")
+        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        required = ("model", "optimizer", "scheduler", "scaler", "step", "effective_step")
+        missing = [key for key in required if key not in checkpoint]
+        if missing:
+            raise KeyError(f"Resume checkpoint is missing required keys: {missing}")
+        if args.resume_strict_config:
+            validate_resume_config(args, checkpoint)
+        resume_step = int(checkpoint["step"])
+        if args.total_training_steps <= resume_step:
+            raise ValueError(
+                f"total_training_steps ({args.total_training_steps}) must be greater than "
+                f"resume checkpoint step ({resume_step})."
+            )
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        move_optimizer_state_to_device(optimizer, args.device)
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        if checkpoint.get("scaler") is not None:
+            scaler.load_state_dict(checkpoint["scaler"])
+        effective_step = int(checkpoint.get("effective_step", resume_step))
+        start_step = resume_step + 1
+        args.resume_from_step = resume_step
+        restore_random_states(checkpoint)
+        old_config = checkpoint_config(checkpoint)
+        logger.info("Resume checkpoint: %s", args.resume_checkpoint)
+        logger.info("Resume step: %d; effective step: %d; start step: %d; target total step: %d",
+                    resume_step, effective_step, start_step, args.total_training_steps)
+        logger.info("Data root: checkpoint=%r current=%r", old_config.get("data_root"), args.data_root)
+        logger.info("Frequency stats path: checkpoint=%r current=%r",
+                    old_config.get("freq_stats_path"), args.freq_stats_path)
+        logger.info("Resume does not restore the dataloader iterator; sample order may differ after restart.")
+
+    logger.info("Scheduler type: %s; last_epoch: %s; step_size: %s; gamma: %s",
+                args.scheduler_type, scheduler.last_epoch, getattr(scheduler, "step_size", None),
+                getattr(scheduler, "gamma", None))
+    for group_idx, group in enumerate(optimizer.param_groups):
+        logger.info("Optimizer param group %d current lr: %.12g", group_idx, group["lr"])
     optimizer.zero_grad(set_to_none=True)
     logger.info("Start DDFSD %s training for %d steps.", args.model_mode, args.total_training_steps)
     logger.info("Margin config for this run: m_rf=%.4f m_ff=%.4f lambda_ff=%.4f", args.m_rf, args.m_ff, args.lambda_ff)
     margin_diag_window = new_margin_diag_window(args.model_mode)
 
-    for step in range(1, args.total_training_steps + 1):
+    for step in range(start_step, args.total_training_steps + 1):
         model.train()
         selected_fake_classes = random.sample(train_fake_classes, 2)
         selected_classes = ["real"] + selected_fake_classes
