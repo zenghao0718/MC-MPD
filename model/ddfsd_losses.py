@@ -394,6 +394,8 @@ def compute_ddfsd_episode_loss(
         # Diagnostics-only prototype-pair distances/weights (all detached in
         # compute_separation_loss; do not participate in backward and do not
         # change loss_total/loss_dual/loss_sep/loss_rf/loss_ff above).
+        "proto_rf_active_dist": sep_out["proto_rf_active_dist"],
+        "proto_ff_active_dist": sep_out["proto_ff_active_dist"],
         "proto_rf_rgb_dist": sep_out["proto_rf_rgb_dist"],
         "proto_rf_freq_dist": sep_out["proto_rf_freq_dist"],
         "proto_rf_fused_dist": sep_out["proto_rf_fused_dist"],

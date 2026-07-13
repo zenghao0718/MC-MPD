@@ -90,6 +90,18 @@ def resolve_model_mode(requested_mode, checkpoint):
     return checkpoint_mode
 
 
+def checkpoint_freq_stats_path(checkpoint):
+    """Return a checkpoint-recorded frequency-statistics path, if present."""
+
+    freq_stats_path = checkpoint.get("freq_stats_path")
+    if freq_stats_path:
+        return freq_stats_path
+    config = checkpoint.get("config", checkpoint.get("args", {}))
+    if isinstance(config, dict):
+        return config.get("freq_stats_path", "")
+    return getattr(config, "freq_stats_path", "")
+
+
 def write_csv(path: str, rows, fieldnames):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -111,6 +123,8 @@ def main():
     model_mode = resolve_model_mode(args.model_mode, checkpoint)
     stats = None
     if model_mode != "rgb-only":
+        if not args.freq_stats_path:
+            args.freq_stats_path = checkpoint_freq_stats_path(checkpoint)
         if not args.freq_stats_path:
             args.freq_stats_path = os.path.join(args.output_dir, "freq_stats.pt")
         if not os.path.exists(args.freq_stats_path):
