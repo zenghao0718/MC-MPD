@@ -9,7 +9,7 @@ EXCLUDE_CLASS=${EXCLUDE_CLASS:-"ADM"}
 OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/ddfsd_full_steps20000_resume_from15000/exclude_${EXCLUDE_CLASS}"}
 TOTAL_STEPS=${TOTAL_STEPS:-20000}; SAVE_INTERVAL=${SAVE_INTERVAL:-2500}
 EVAL_INTERVAL=${EVAL_INTERVAL:-2500}; LOG_INTERVAL=${LOG_INTERVAL:-200}
-SCHEDULER_TYPE=${SCHEDULER_TYPE:-"step"}; LR_SCHEDULER_STEP=${LR_SCHEDULER_STEP:-15000}
+SCHEDULER_TYPE=${SCHEDULER_TYPE:-"step"}; LR_SCHEDULER_STEP=${LR_SCHEDULER_STEP:-5000}
 LR_SCHEDULER_GAMMA=${LR_SCHEDULER_GAMMA:-0.5}; NUM_WORKERS=${NUM_WORKERS:-8}
 
 for path in "${DATA_ROOT}" "${CKPT_PATH}" "${FREQ_STATS_PATH}"; do [[ -e "${path}" ]] || { echo "Missing required path: ${path}" >&2; exit 1; }; done
@@ -18,7 +18,7 @@ if [[ -d "${OUTPUT_PATH}/ckpt" ]] && find "${OUTPUT_PATH}/ckpt" -maxdepth 1 -nam
 fi
 python tools/inspect_ddfsd_checkpoint.py --checkpoint "${CKPT_PATH}" --expected_step 15000 \
   --expected_exclude_class "${EXCLUDE_CLASS}" --expected_scheduler_type step \
-  --expected_lr_scheduler_step 15000 --expected_lr_scheduler_gamma 0.5
+  --expected_lr_scheduler_step "${LR_SCHEDULER_STEP}" --expected_lr_scheduler_gamma 0.5
 printf '%s\n' "DATA_ROOT=${DATA_ROOT}" "RUN_ROOT=${RUN_ROOT}" "OUTPUT_PATH=${OUTPUT_PATH}" \
   "EXCLUDE_CLASS=${EXCLUDE_CLASS}" "CKPT_PATH=${CKPT_PATH}" "FREQ_STATS_PATH=${FREQ_STATS_PATH}" \
   "TOTAL_STEPS=${TOTAL_STEPS}" "SAVE_INTERVAL=${SAVE_INTERVAL}" "EVAL_INTERVAL=${EVAL_INTERVAL}" \
