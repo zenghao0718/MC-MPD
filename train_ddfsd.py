@@ -309,7 +309,18 @@ def validate_resume_config(args, checkpoint):
     mismatches = []
     for key in RESUME_CONFIG_KEYS:
         if key not in config:
-            mismatches.append(f"{key}: missing from checkpoint (current={getattr(args, key)!r})")
+            # Legacy checkpoints saved before this key existed in the config schema
+            # (e.g. model_mode) have nothing to compare against. Skip the strict
+            # comparison for that key only, and log it instead of hard-failing, so
+            # that formal resumes of pre-existing checkpoints remain possible.
+            # Every key that IS present in the checkpoint is still strictly checked
+            # below.
+            logger.warn(
+                "Resume config key '%s' is absent from the checkpoint config "
+                "(legacy checkpoint format); skipping strict comparison for this "
+                "key and using the current CLI value: %r",
+                key, getattr(args, key),
+            )
             continue
         old, current = config[key], getattr(args, key)
         equal = math.isclose(old, current, rel_tol=1e-7, abs_tol=1e-12) if (
