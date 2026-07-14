@@ -35,6 +35,13 @@ def parse_args():
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--ckpt_step", type=int, default=0)
     parser.add_argument("--model_mode", type=str, default="auto", choices=["auto", "dual", "rgb-only", "freq-only"])
+    parser.add_argument(
+        "--branch_mode",
+        type=str,
+        default=None,
+        choices=["dual", "rgb-only", "freq-only"],
+        help="Inference branch; defaults to the checkpoint model mode for backward compatibility.",
+    )
     parser.add_argument("--freq_stats_path", type=str, default="")
     parser.add_argument("--num_support_test", type=int, default=10)
     parser.add_argument("--num_query_test", type=int, default=0)
@@ -121,6 +128,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = load_checkpoint(args.ckpt_path)
     model_mode = resolve_model_mode(args.model_mode, checkpoint)
+    branch_mode = args.branch_mode or model_mode
+    if model_mode != "dual" and branch_mode != model_mode:
+        raise ValueError(
+            f"A {model_mode} checkpoint can only be evaluated with --branch_mode {model_mode}; "
+            f"requested {branch_mode}."
+        )
     stats = None
     if model_mode != "rgb-only":
         if not args.freq_stats_path:
@@ -136,6 +149,10 @@ def main():
     else:
         args.freq_stats_path = ""
 
+    logger.info(
+        "DDFSD evaluation: checkpoint_model_mode=%s branch_mode=%s checkpoint=%s output_dir=%s",
+        model_mode, branch_mode, args.ckpt_path, args.output_dir,
+    )
     model = DDFSDDualDomainNet(pretrained=args.pretrained, model_mode=model_mode)
     if stats is not None:
         model.set_freq_stats(stats["mean"], stats["std"])
@@ -166,11 +183,12 @@ def main():
             tau_r=args.tau_r,
             max_query_per_class=args.max_eval_query_per_class,
             model_mode=model_mode,
-            branch_mode=model_mode,
+            branch_mode=branch_mode,
         )
         row = {
+            "checkpoint_model_mode": model_mode,
             "model_mode": model_mode,
-            "branch_mode": model_mode,
+            "branch_mode": branch_mode,
             "exclude_class": args.exclude_class,
             "seed": seed,
             "support_shot": args.num_support_test,
@@ -188,7 +206,9 @@ def main():
         }
         per_seed_rows.append(row)
         logger.info(
-            "DDFSD eval seed %d: ACC %.6f AP %.6f AUC %.6f",
+            "DDFSD eval checkpoint_model_mode=%s branch_mode=%s seed=%d: ACC %.6f AP %.6f AUC %.6f",
+            model_mode,
+            branch_mode,
             seed,
             metrics["acc"],
             metrics["ap"],
@@ -205,8 +225,9 @@ def main():
     auc_mean, auc_std = mean_std("auc")
     summary_rows = [
         {
+            "checkpoint_model_mode": model_mode,
             "model_mode": model_mode,
-            "branch_mode": model_mode,
+            "branch_mode": branch_mode,
             "exclude_class": args.exclude_class,
             "support_shot": args.num_support_test,
             "ckpt_step": ckpt_step,
@@ -228,6 +249,7 @@ def main():
         per_seed_path,
         per_seed_rows,
         [
+            "checkpoint_model_mode",
             "model_mode",
             "branch_mode",
             "exclude_class",
@@ -250,6 +272,7 @@ def main():
         summary_path,
         summary_rows,
         [
+            "checkpoint_model_mode",
             "model_mode",
             "branch_mode",
             "exclude_class",
