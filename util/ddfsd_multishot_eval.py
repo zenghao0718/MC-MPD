@@ -1,8 +1,7 @@
 """Deterministic, cached 0/multi-shot evaluation helpers for DDFSD."""
 
-import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
@@ -14,6 +13,13 @@ from model.ddfsd_losses import (
     compute_support_sigmas,
 )
 from util.ddfsd_eval import binary_metrics, encode_batch
+from util.ddfsd_multishot_logic import (
+    build_multishot_support_query_indices,
+    nested_support_indices,
+    parse_shot_list,
+    sample_metadata_indices,
+    select_real_and_nearest_fake_logits,
+)
 
 
 @dataclass
@@ -21,45 +27,6 @@ class EmbeddingCache:
     paths: List[str]
     rgb: Optional[torch.Tensor]
     freq: Optional[torch.Tensor]
-
-
-def parse_shot_list(value: str) -> List[int]:
-    try:
-        shots = sorted({int(item.strip()) for item in value.split(",") if item.strip()})
-    except ValueError as exc:
-        raise ValueError(f"Invalid --shot_list {value!r}; expected comma-separated integers.") from exc
-    if not shots:
-        raise ValueError("--shot_list must contain at least one shot.")
-    if shots[0] < 0:
-        raise ValueError("Shots must be non-negative.")
-    return shots
-
-
-def build_multishot_support_query_indices(
-    dataset_size: int,
-    max_shot: int,
-    seed: int,
-) -> Tuple[List[int], List[int]]:
-    """Shuffle once, reserving max_shot candidates and a fixed query suffix."""
-    if max_shot < 0:
-        raise ValueError("max_shot must be non-negative.")
-    if dataset_size <= max_shot:
-        raise ValueError(
-            f"Need more than max_shot={max_shot} val images to retain a query, got {dataset_size}."
-        )
-    indices = list(range(dataset_size))
-    random.Random(seed).shuffle(indices)
-    return indices[:max_shot], indices[max_shot:]
-
-
-def sample_metadata_indices(dataset_size: int, count: int, seed: int) -> List[int]:
-    if count <= 0:
-        raise ValueError("zero_shot_metadata_per_class must be positive.")
-    if dataset_size < count:
-        raise ValueError(f"Metadata class has {dataset_size} images, fewer than requested {count}.")
-    indices = list(range(dataset_size))
-    random.Random(seed).shuffle(indices)
-    return indices[:count]
 
 
 @torch.no_grad()
@@ -123,8 +90,8 @@ def evaluate_few_shot_embeddings(
 ) -> Dict[str, float]:
     if shot <= 0:
         raise ValueError("Few-shot embedding evaluation requires shot > 0.")
-    rs_rgb, rs_freq = _select(real_cache, real_support)
-    fs_rgb, fs_freq = _select(fake_cache, fake_support)
+    rs_rgb, rs_freq = _select(real_cache, nested_support_indices(real_support, shot))
+    fs_rgb, fs_freq = _select(fake_cache, nested_support_indices(fake_support, shot))
     support_rgb = _support_tensor(rs_rgb, fs_rgb, shot, device)
     support_freq = _support_tensor(rs_freq, fs_freq, shot, device)
     proto_rgb, proto_freq = compute_prototypes(support_rgb, support_freq, model_mode=model_mode)
@@ -191,7 +158,8 @@ def evaluate_zero_shot_embeddings(
             proto_rgb=proto_rgb, proto_freq=proto_freq, alpha=alpha, tau=tau,
             branch_mode=branch_mode, model_mode=model_mode,
         )["logits"].squeeze(0)
-        return torch.stack([logits[:, 0], logits[:, 1:].max(dim=1).values], dim=-1)
+        real_logits, fake_logits = select_real_and_nearest_fake_logits(logits)
+        return torch.stack([real_logits, fake_logits], dim=-1)
 
     metrics = _metrics_from_logits(binary_logits(real_cache, real_query), binary_logits(fake_cache, fake_query))
     values = alpha.detach().cpu().flatten() if alpha is not None else None

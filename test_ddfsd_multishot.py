@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from test_ddfsd import (
     checkpoint_freq_stats_path, load_checkpoint, resolve_model_mode, str2bool, write_csv,
 )
+from util.ddfsd_multishot_logic import resolve_checkpoint_step
 
 
 def parse_args():
@@ -107,6 +108,12 @@ def main():
     if not os.path.isfile(args.ckpt_path):
         raise FileNotFoundError(f"Checkpoint does not exist: {args.ckpt_path}")
     checkpoint = load_checkpoint(args.ckpt_path)
+    checkpoint_step = int(checkpoint.get("step", 0))
+    ckpt_step = resolve_checkpoint_step(args.ckpt_step, checkpoint_step, args.ckpt_path)
+    if ckpt_step == 0:
+        logger.warning(
+            "Neither --ckpt_step nor checkpoint metadata records a positive step; results use ckpt_step=0."
+        )
     checkpoint_mode = resolve_model_mode(args.model_mode, checkpoint)
     branch_mode = args.branch_mode or checkpoint_mode
     if checkpoint_mode != "dual" and branch_mode != checkpoint_mode:
@@ -124,8 +131,6 @@ def main():
         model.set_freq_stats(stats["mean"], stats["std"])
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
-    ckpt_step = args.ckpt_step or int(checkpoint.get("step", 0))
-
     real_ds = load_ddfsd_class_dataset(args.data_root, "real", "val")
     fake_ds = load_ddfsd_class_dataset(args.data_root, args.exclude_class, "val")
     real_cache = encode_dataset_indices(model, real_ds, range(len(real_ds)), args.eval_batch_size,
@@ -218,7 +223,8 @@ def main():
               ["exclude_class", "seed", "data_class", "split", "dataset_index", "filepath", "role", "support_rank"])
     write_csv(os.path.join(args.output_dir, "zero_shot_metadata_manifest.csv"), metadata_rows,
               ["exclude_class", "seed", "metadata_class", "split", "dataset_index", "filepath", "metadata_rank"])
-    config = {"shot_list": shots, "seeds": seeds, "zero_shot_metadata_per_class": args.zero_shot_metadata_per_class,
+    config = {"exclude_class": args.exclude_class, "shot_list": shots, "seeds": seeds,
+              "zero_shot_metadata_per_class": args.zero_shot_metadata_per_class,
               "max_shot": max_shot, "max_eval_query_per_class": args.max_eval_query_per_class,
               "data_root": os.path.abspath(args.data_root), "ckpt_path": os.path.abspath(args.ckpt_path),
               "ckpt_step": ckpt_step, "freq_stats_path": os.path.abspath(args.freq_stats_path) if args.freq_stats_path else "",

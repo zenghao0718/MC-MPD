@@ -2,9 +2,11 @@
 
 import argparse
 import csv
+import json
 import os
 import statistics
-from collections import defaultdict
+
+from util.ddfsd_multishot_logic import validate_config_consistency
 
 
 CLASSES = ["ADM", "BigGAN", "glide", "Midjourney", "SD", "VQDM"]
@@ -36,26 +38,106 @@ def parse_args():
     parser.add_argument("--input_root", required=True,
                         help="Parent containing exclude_<class>/multishot/multishot_per_seed.csv")
     parser.add_argument("--output_dir", default="")
+    parser.add_argument("--result_dir_template", default="",
+                        help="Optional class result directory template supporting {class} and {step}.")
+    parser.add_argument("--ckpt_step", type=int, default=0)
     return parser.parse_args()
+
+
+def locate_result_dir(input_root, class_name, template="", ckpt_step=0):
+    if template:
+        result = template.replace("{class}", class_name).replace("{step}", str(ckpt_step))
+        return os.path.abspath(result)
+    candidates = [os.path.join(input_root, f"exclude_{class_name}", "multishot"),
+                  os.path.join(input_root, f"exclude_{class_name}")]
+    matches = [path for path in candidates if os.path.isfile(os.path.join(path, "multishot_per_seed.csv"))]
+    if not matches:
+        raise FileNotFoundError(f"Missing multishot result directory for {class_name}; checked {candidates}")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple result directories found for {class_name}: {matches}")
+    return matches[0]
+
+
+def validate_class_rows(class_name, rows, config, source_path):
+    if not rows:
+        raise ValueError(f"Empty per-seed CSV for {class_name}: {source_path}")
+    if any(row.get("exclude_class") != class_name for row in rows):
+        raise ValueError(f"exclude_class mismatch in {source_path}; expected {class_name}")
+    actual = {(int(row["seed"]), int(row["shot"])) for row in rows}
+    expected = {(int(seed), int(shot)) for seed in config["seeds"] for shot in config["shot_list"]}
+    if actual != expected:
+        raise ValueError(
+            f"Seed/shot set mismatch for {class_name}: missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
+    keys = [(int(row["seed"]), int(row["shot"])) for row in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"Duplicate seed/shot rows for {class_name}: {source_path}")
+    for row in rows:
+        checks = {
+            "ckpt_step": int(row["ckpt_step"]),
+            "checkpoint_model_mode": row["checkpoint_model_mode"],
+            "model_mode": row["model_mode"],
+            "branch_mode": row["branch_mode"],
+            "ckpt_path": os.path.abspath(row["ckpt_path"]),
+            "freq_stats_path": os.path.abspath(row["freq_stats_path"]) if row["freq_stats_path"] else "",
+        }
+        for field, value in checks.items():
+            expected_value = config[field]
+            if field in {"ckpt_path", "freq_stats_path"} and expected_value:
+                expected_value = os.path.abspath(expected_value)
+            if value != expected_value:
+                raise ValueError(
+                    f"{class_name} row/config mismatch for {field}: row={value!r}, config={expected_value!r}"
+                )
 
 
 def main():
     args = parse_args(); output = args.output_dir or args.input_root
     rows = []
+    configs = {}
     for name in CLASSES:
-        candidates = [os.path.join(args.input_root, f"exclude_{name}", "multishot", "multishot_per_seed.csv"),
-                      os.path.join(args.input_root, f"exclude_{name}", "multishot_per_seed.csv")]
-        path = next((p for p in candidates if os.path.isfile(p)), None)
-        if path is None:
-            raise FileNotFoundError(f"Missing multishot_per_seed.csv for {name}; checked {candidates}")
+        result_dir = locate_result_dir(
+            args.input_root, name, template=args.result_dir_template, ckpt_step=args.ckpt_step
+        )
+        path = os.path.join(result_dir, "multishot_per_seed.csv")
+        config_path = os.path.join(result_dir, "multishot_config.json")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Missing multishot_per_seed.csv for {name}: {path}")
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(f"Missing multishot_config.json for {name}: {config_path}")
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        if config.get("exclude_class") != name:
+            raise ValueError(
+                f"Config exclude_class mismatch for directory {result_dir}: "
+                f"expected {name}, got {config.get('exclude_class')!r}"
+            )
+        if not config.get("ckpt_path"):
+            raise ValueError(f"Config has empty ckpt_path for {name}: {config_path}")
+        if config.get("checkpoint_model_mode") != "rgb-only" and not config.get("freq_stats_path"):
+            raise ValueError(f"Config has empty freq_stats_path for {name}: {config_path}")
+        configs[name] = config
         class_rows = read_csv(path)
-        if any(row["exclude_class"] != name for row in class_rows):
-            raise ValueError(f"Class mismatch in {path}")
+        validate_class_rows(name, class_rows, config, path)
         rows.extend(class_rows)
+    validate_config_consistency(configs)
+    checkpoint_paths = {os.path.abspath(config["ckpt_path"]) for config in configs.values()}
+    if len(checkpoint_paths) != len(CLASSES):
+        mapping = ", ".join(f"{name}={configs[name]['ckpt_path']}" for name in CLASSES)
+        raise ValueError(f"Checkpoint paths must be class-specific and unique: {mapping}")
+    frequency_paths = {
+        os.path.abspath(config["freq_stats_path"])
+        for config in configs.values() if config["checkpoint_model_mode"] != "rgb-only"
+    }
+    frequency_classes = sum(config["checkpoint_model_mode"] != "rgb-only" for config in configs.values())
+    if len(frequency_paths) != frequency_classes:
+        mapping = ", ".join(f"{name}={configs[name]['freq_stats_path']}" for name in CLASSES)
+        raise ValueError(f"Frequency-stat paths must be class-specific and unique: {mapping}")
     keys = [(r["exclude_class"], int(r["seed"]), int(r["shot"])) for r in rows]
     if len(keys) != len(set(keys)):
         raise ValueError("Duplicate exclude_class/seed/shot rows found.")
-    seeds = sorted({int(r["seed"]) for r in rows}); shots = sorted({int(r["shot"]) for r in rows})
+    seeds = list(configs[CLASSES[0]]["seeds"]); shots = list(configs[CLASSES[0]]["shot_list"])
     expected = {(c, s, k) for c in CLASSES for s in seeds for k in shots}
     missing = expected - set(keys)
     if missing:

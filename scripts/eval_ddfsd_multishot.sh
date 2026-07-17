@@ -14,6 +14,7 @@ EVAL_SEEDS=${EVAL_SEEDS:-"42,101,102,103,104"}
 EVAL_REPEATS=${EVAL_REPEATS:-5}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-128}
 ZERO_SHOT_METADATA_PER_CLASS=${ZERO_SHOT_METADATA_PER_CLASS:-1024}
+MAX_EVAL_QUERY_PER_CLASS=${MAX_EVAL_QUERY_PER_CLASS:-0}
 MODEL_MODE=${MODEL_MODE:-auto}
 BRANCH_MODE=${BRANCH_MODE:-}
 
@@ -33,5 +34,6 @@ python test_ddfsd_multishot.py \
   --model_mode "${MODEL_MODE}" "${branch_args[@]}" \
   --shot_list "${SHOT_LIST}" --eval_repeats "${EVAL_REPEATS}" --eval_seeds "${EVAL_SEEDS}" \
   --eval_batch_size "${EVAL_BATCH_SIZE}" \
+  --max_eval_query_per_class "${MAX_EVAL_QUERY_PER_CLASS}" \
   --zero_shot_metadata_per_class "${ZERO_SHOT_METADATA_PER_CLASS}" \
   --tau 0.2 --tau_r 0.1 --use_fp16 True --pretrained False
