@@ -14,6 +14,7 @@ from torchvision import transforms
 
 ALL_CLASSES = ["real", "ADM", "BigGAN", "glide", "Midjourney", "SD", "VQDM"]
 FAKE_CLASSES = ["ADM", "BigGAN", "glide", "Midjourney", "SD", "VQDM"]
+VALID_TRAINING_SCOPES = {"leave-one-out", "all-source"}
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -26,6 +27,28 @@ def validate_generator_name(class_name: str, allow_real: bool = False) -> None:
 def get_train_fake_classes(exclude_class: str) -> List[str]:
     validate_generator_name(exclude_class)
     return [name for name in FAKE_CLASSES if name != exclude_class]
+
+
+def resolve_train_fake_classes(
+    training_scope: str,
+    exclude_class: Optional[str] = None,
+) -> List[str]:
+    """Resolve the stable GenImage fake-class candidate list for training.
+
+    ``all-source`` only expands the pool sampled by each episode.  It does not
+    change the fixed real + two-fake episode layout.
+    """
+
+    if training_scope == "all-source":
+        return list(FAKE_CLASSES)
+    if training_scope == "leave-one-out":
+        if not exclude_class:
+            raise ValueError("leave-one-out training requires --exclude_class.")
+        return get_train_fake_classes(exclude_class)
+    raise ValueError(
+        f"Unknown training_scope '{training_scope}'. "
+        f"Expected one of: {sorted(VALID_TRAINING_SCOPES)}"
+    )
 
 
 def _collect_image_paths(root: str) -> List[str]:

@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from datasets.ddfsd_datasets import (
+    ALL_CLASSES,
     FAKE_CLASSES,
     ImagePathDataset,
     make_stats_transform,
@@ -125,19 +126,38 @@ def compute_frequency_stats_from_loader(loader: DataLoader, device: torch.device
 
 def compute_frequency_stats(
     data_root: str,
-    exclude_class: str,
     output_path: str,
+    classes: Optional[Iterable[str]] = None,
+    exclude_class: Optional[str] = None,
     batch_size: int = 128,
     num_workers: int = 8,
     device: Optional[torch.device] = None,
     fake_classes: Iterable[str] = FAKE_CLASSES,
 ) -> Dict[str, torch.Tensor]:
-    """Compute and save train-split stats for real + non-excluded fake classes."""
+    """Compute and save GenImage train-split frequency statistics.
+
+    Explicit ``classes`` enables all-source statistics.  If it is omitted,
+    the legacy real + non-excluded-fakes behavior is retained.
+    """
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    classes = ["real"] + [name for name in fake_classes if name != exclude_class]
+    if classes is None:
+        if not exclude_class:
+            raise ValueError("exclude_class is required when classes is not provided.")
+        classes = ["real"] + [name for name in fake_classes if name != exclude_class]
+    else:
+        classes = list(classes)
+        if not classes:
+            raise ValueError("classes must not be empty.")
+        unknown = [name for name in classes if name not in ALL_CLASSES]
+        if unknown:
+            raise ValueError(
+                f"Frequency statistics only support GenImage classes; unknown classes: {unknown}"
+            )
+        if len(set(classes)) != len(classes):
+            raise ValueError(f"Frequency-stat classes contain duplicates: {classes}")
     transform = make_stats_transform()
     total_sum = torch.zeros(3, dtype=torch.float64, device=device)
     total_sq_sum = torch.zeros(3, dtype=torch.float64, device=device)

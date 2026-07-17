@@ -176,12 +176,16 @@ cython_debug/
 # large data / outputs
 data/
 runs/
+logs/
 tf-logs/
 checkpoints/
 weights/
 *.pth
 *.pt
 *.ckpt
+*.parquet
+MS_COCOAI/images/
+MS_COCOAI/manifests/
 
 # python cache
 __pycache__/

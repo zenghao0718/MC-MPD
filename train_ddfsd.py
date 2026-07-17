@@ -29,6 +29,12 @@ def parse_args():
     parser.add_argument("--use_fp16", type=str2bool, default=True)
     parser.add_argument("--pretrained", type=str2bool, default=True)
     parser.add_argument("--model_mode", type=str, default="dual", choices=["dual", "rgb-only", "freq-only"])
+    parser.add_argument(
+        "--training_scope",
+        type=str,
+        default="leave-one-out",
+        choices=["leave-one-out", "all-source"],
+    )
     parser.add_argument("--exclude_class", type=str, default="ADM")
     parser.add_argument("--batch_size", type=int, default=16, help="Episode batch size.")
     parser.add_argument("--num_class_train", type=int, default=3)
@@ -95,7 +101,7 @@ def parse_args():
 
 def load_runtime_dependencies():
     global np, torch, dist, GradScaler, autocast, LambdaLR, StepLR, SummaryWriter
-    global logger, build_train_iterators, get_train_fake_classes, validate_generator_name
+    global logger, build_train_iterators, resolve_train_fake_classes, validate_generator_name
     global DDFSDDualDomainNet, compute_ddfsd_episode_loss, compute_lambda_sep, sample_branch_mode
     global evaluate_binary_few_shot, compute_frequency_stats, load_frequency_stats, setup_dist
 
@@ -109,7 +115,7 @@ def load_runtime_dependencies():
     import util.logger as logger
     from datasets.ddfsd_datasets import (
         build_train_iterators,
-        get_train_fake_classes,
+        resolve_train_fake_classes,
         validate_generator_name,
     )
     from model.ddfsd import DDFSDDualDomainNet
@@ -290,7 +296,7 @@ def create_scheduler(optimizer, args):
 
 
 RESUME_CONFIG_KEYS = (
-    "model", "model_mode", "exclude_class", "batch_size", "num_class_train",
+    "model", "model_mode", "training_scope", "source_fake_classes", "exclude_class", "batch_size", "num_class_train",
     "num_support_train", "num_query_train", "accumulation_steps", "scheduler_type",
     "lr_scheduler_step", "lr_scheduler_gamma", "rgb_backbone_lr", "freq_backbone_lr",
     "rgb_head_lr", "freq_head_lr", "weight_decay", "tau", "tau_r", "m_rf", "m_ff",
@@ -306,6 +312,15 @@ def checkpoint_config(checkpoint):
 
 def validate_resume_config(args, checkpoint):
     config = checkpoint_config(checkpoint)
+    if args.training_scope == "all-source":
+        missing_scope_keys = [
+            key for key in ("training_scope", "source_fake_classes") if key not in config
+        ]
+        if missing_scope_keys:
+            raise ValueError(
+                "An all-source strict resume requires checkpoint metadata for "
+                f"{missing_scope_keys}; refusing to treat a legacy/leave-one-out checkpoint as all-source."
+            )
     mismatches = []
     for key in RESUME_CONFIG_KEYS:
         if key not in config:
@@ -370,7 +385,10 @@ def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimiz
             "args": args,
             "config": vars(args),
             "model_mode": args.model_mode,
-            "exclude_class": args.exclude_class,
+            "training_scope": args.training_scope,
+            "source_fake_classes": list(args.source_fake_classes),
+            "source_classes": list(args.source_classes),
+            "exclude_class": args.exclude_class if args.training_scope == "leave-one-out" else None,
             "freq_stats_path": args.freq_stats_path if args.model_mode != "rgb-only" else None,
             "resume_from_checkpoint": args.resume_checkpoint or None,
             "resume_from_step": getattr(args, "resume_from_step", 0),
@@ -387,7 +405,8 @@ def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimiz
 
 def prepare_frequency_stats(args):
     if not args.freq_stats_path:
-        args.freq_stats_path = os.path.join(args.output_dir, "freq_stats.pt")
+        filename = "freq_stats_allsource.pt" if args.training_scope == "all-source" else "freq_stats.pt"
+        args.freq_stats_path = os.path.join(args.output_dir, filename)
 
     if os.path.exists(args.freq_stats_path):
         return load_frequency_stats(args.freq_stats_path)
@@ -402,8 +421,9 @@ def prepare_frequency_stats(args):
         logger.info("Frequency stats not found. Computing train-split stats at %s", args.freq_stats_path)
         compute_frequency_stats(
             data_root=args.data_root,
-            exclude_class=args.exclude_class,
             output_path=args.freq_stats_path,
+            classes=args.source_classes if args.training_scope == "all-source" else None,
+            exclude_class=args.exclude_class if args.training_scope == "leave-one-out" else None,
             batch_size=args.freq_stats_batch_size,
             num_workers=args.num_workers,
             device=torch.device("cuda", args.local_rank),
@@ -414,7 +434,15 @@ def prepare_frequency_stats(args):
 
 
 def validate_args(args):
-    validate_generator_name(args.exclude_class)
+    if args.training_scope == "leave-one-out":
+        validate_generator_name(args.exclude_class)
+    args.source_fake_classes = resolve_train_fake_classes(
+        training_scope=args.training_scope,
+        exclude_class=args.exclude_class,
+    )
+    args.source_classes = ["real"] + list(args.source_fake_classes)
+    if args.training_scope == "all-source":
+        args.exclude_class = None
     if args.num_class_train != 3:
         raise ValueError("DDFSD v1 training is fixed to real + 2 fake classes, so num_class_train must be 3.")
     if args.num_support_train != 5 or args.num_query_train != 5:
@@ -432,7 +460,9 @@ def validate_args(args):
 
 
 def run_validation(model, args, step, tb_writer):
-    fake_classes = get_train_fake_classes(args.exclude_class) + [args.exclude_class]
+    fake_classes = list(args.source_fake_classes)
+    if args.training_scope == "leave-one-out":
+        fake_classes.append(args.exclude_class)
     for fake_class in fake_classes:
         metrics_per_repeat = []
         for repeat_idx in range(args.val_eval_repeats):
@@ -458,7 +488,11 @@ def run_validation(model, args, step, tb_writer):
         acc = float(np.mean([item["acc"] for item in metrics_per_repeat]))
         ap = float(np.mean([item["ap"] for item in metrics_per_repeat]))
         auc = float(np.mean([item["auc"] for item in metrics_per_repeat]))
-        split = "val_unseen" if fake_class == args.exclude_class else "val_seen"
+        split = (
+            "val_unseen"
+            if args.training_scope == "leave-one-out" and fake_class == args.exclude_class
+            else "val_seen"
+        )
         logger.info(
             "Validation %s/%s at step %d: ACC %.6f AP %.6f AUC %.6f",
             split,
@@ -494,7 +528,7 @@ def main():
         logger.info("model_mode=rgb-only: skipping frequency-stat loading and computation.")
 
     images_per_class = (args.num_support_train + args.num_query_train) * args.batch_size
-    train_fake_classes = get_train_fake_classes(args.exclude_class)
+    train_fake_classes = list(args.source_fake_classes)
     train_classes = ["real"] + train_fake_classes
     train_iters = build_train_iterators(
         data_root=args.data_root,
@@ -576,6 +610,8 @@ def main():
         logger.info("Optimizer param group %d current lr: %.12g", group_idx, group["lr"])
     optimizer.zero_grad(set_to_none=True)
     logger.info("Start DDFSD %s training for %d steps.", args.model_mode, args.total_training_steps)
+    logger.info("Training scope: %s", args.training_scope)
+    logger.info("Source fake classes: %s", ", ".join(args.source_fake_classes))
     logger.info("Margin config for this run: m_rf=%.4f m_ff=%.4f lambda_ff=%.4f", args.m_rf, args.m_ff, args.lambda_ff)
     margin_diag_window = new_margin_diag_window(args.model_mode)
 
