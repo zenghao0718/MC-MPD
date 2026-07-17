@@ -12,11 +12,11 @@
 ## Implemented source areas
 
 - Training scope resolution, training logs, validation split behavior, checkpoint metadata, and strict resume protection.
-- Explicit GenImage class lists for frequency statistics and `freq_stats_allsource.pt`.
+- Provenance-bearing GenImage frequency statistics, SHA sidecar preparation, and checkpoint SHA/metadata binding.
 - Streaming Parquet row-group extraction of original bytes with SHA verification and provenance.
 - Stable caption/label occurrence grouping with anomaly output.
-- Fixed test 5-seed × 10-shot and validation smoke manifests with file/SHA checks.
-- External manifest Dataset and no-gradient DDFSD transfer evaluator.
+- Fixed test 5-seed × 10-shot and validation smoke manifests with path/group/SHA leakage checks and a machine-readable lock.
+- External manifest Dataset and no-gradient DDFSD transfer evaluator with formal-artifact validation and overwrite protection.
 - Per-image scores, metrics/config/provenance JSON, and independent ACC/AP/AUC summarization.
 - AutoDL training/smoke/formal/acceptance scripts.
 - Pure-standard-library grouping and split tests.

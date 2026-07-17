@@ -33,7 +33,7 @@ def sha256_bytes(value: bytes) -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input_root", default="/root/autodl-tmp/MS_COCOAI")
-    parser.add_argument("--output_root", default="/root/autodl-tmp/MS_COCOAI_extracted")
+    parser.add_argument("--output_root", default="/root/autodl-tmp/MS_COCOAI")
     parser.add_argument("--split", required=True, choices=["validation", "test"])
     parser.add_argument("--max_rows", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
@@ -156,7 +156,7 @@ def main():
                 if args.max_rows and processed >= args.max_rows:
                     break
             if args.max_rows and processed >= args.max_rows:
-                    break
+                break
     provenance = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "input_root": str(Path(args.input_root).resolve()),

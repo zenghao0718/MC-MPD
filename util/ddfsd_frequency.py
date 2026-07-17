@@ -5,7 +5,11 @@ raw RGB tensor before ImageNet normalization.
 """
 
 import os
-from typing import Dict, Iterable, Optional
+import hashlib
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -76,18 +80,79 @@ def _validate_stats_tensor(value: torch.Tensor, name: str) -> torch.Tensor:
     return value
 
 
-def save_frequency_stats(path: str, mean: torch.Tensor, std: torch.Tensor) -> None:
+ALLSOURCE_CLASSES = ["real"] + list(FAKE_CLASSES)
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_commit() -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:  # noqa: BLE001 - provenance is best effort outside a checkout
+        return None
+
+
+def validate_allsource_frequency_metadata(metadata: Any) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        raise ValueError("All-source frequency statistics require metadata.")
+    expected = {
+        "training_scope": "all-source",
+        "dataset": "GenImage",
+        "split": "train",
+        "classes": ALLSOURCE_CLASSES,
+    }
+    mismatches = [
+        f"{key}={metadata.get(key)!r} (expected {value!r})"
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    ]
+    class_counts = metadata.get("class_counts")
+    if not isinstance(class_counts, dict) or list(class_counts) != ALLSOURCE_CLASSES:
+        mismatches.append(
+            f"class_counts keys={list(class_counts) if isinstance(class_counts, dict) else class_counts!r} "
+            f"(expected {ALLSOURCE_CLASSES!r})"
+        )
+    elif any(not isinstance(class_counts[name], int) or class_counts[name] <= 0 for name in ALLSOURCE_CLASSES):
+        mismatches.append("class_counts must contain positive integer counts for every source class")
+    data_root = str(metadata.get("data_root", ""))
+    if "MS_COCOAI" in data_root.upper().replace("-", "_"):
+        mismatches.append(f"data_root must be GenImage, not MS COCOAI: {data_root!r}")
+    if not metadata.get("created_at_utc"):
+        mismatches.append("created_at_utc is missing")
+    if not metadata.get("code_git_commit"):
+        mismatches.append("code_git_commit is missing")
+    if mismatches:
+        raise ValueError("Invalid all-source frequency metadata: " + "; ".join(mismatches))
+    return metadata
+
+
+def save_frequency_stats(
+    path: str,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
     """Save DDFSD frequency statistics with mean/std shape exactly [3]."""
 
     stats = {
         "mean": _validate_stats_tensor(mean, "mean"),
         "std": _validate_stats_tensor(std, "std"),
     }
+    if metadata is not None:
+        stats["metadata"] = dict(metadata)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     torch.save(stats, path)
 
 
-def load_frequency_stats(path: str, map_location: Optional[str] = "cpu") -> Dict[str, torch.Tensor]:
+def load_frequency_stats(path: str, map_location: Optional[str] = "cpu") -> Dict[str, Any]:
     """Load and validate DDFSD frequency statistics."""
 
     if not os.path.exists(path):
@@ -98,6 +163,7 @@ def load_frequency_stats(path: str, map_location: Optional[str] = "cpu") -> Dict
     return {
         "mean": _validate_stats_tensor(stats["mean"], "mean"),
         "std": _validate_stats_tensor(stats["std"], "std"),
+        "metadata": stats.get("metadata"),
     }
 
 
@@ -133,7 +199,7 @@ def compute_frequency_stats(
     num_workers: int = 8,
     device: Optional[torch.device] = None,
     fake_classes: Iterable[str] = FAKE_CLASSES,
-) -> Dict[str, torch.Tensor]:
+) -> Dict[str, Any]:
     """Compute and save GenImage train-split frequency statistics.
 
     Explicit ``classes`` enables all-source statistics.  If it is omitted,
@@ -158,14 +224,19 @@ def compute_frequency_stats(
             )
         if len(set(classes)) != len(classes):
             raise ValueError(f"Frequency-stat classes contain duplicates: {classes}")
+    classes = list(classes)
+    if "MS_COCOAI" in str(data_root).upper().replace("-", "_"):
+        raise ValueError("Frequency statistics must come from GenImage, not MS COCOAI.")
     transform = make_stats_transform()
     total_sum = torch.zeros(3, dtype=torch.float64, device=device)
     total_sq_sum = torch.zeros(3, dtype=torch.float64, device=device)
     total_count = 0
 
+    class_counts = {}
     for class_name in classes:
         class_root = os.path.join(data_root, class_name, "train")
         dataset = ImagePathDataset(class_root, transform=transform)
+        class_counts[class_name] = len(dataset)
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -189,5 +260,17 @@ def compute_frequency_stats(
     mean = total_sum / total_count
     var = (total_sq_sum / total_count) - mean.pow(2)
     std = var.clamp_min(0.0).sqrt()
-    save_frequency_stats(output_path, mean.float().cpu(), std.float().cpu())
+    metadata = {
+        "training_scope": "all-source" if classes == ALLSOURCE_CLASSES else "leave-one-out",
+        "dataset": "GenImage",
+        "split": "train",
+        "classes": classes,
+        "class_counts": {name: class_counts[name] for name in classes},
+        "data_root": str(Path(data_root).resolve()),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "code_git_commit": _git_commit(),
+    }
+    if classes == ALLSOURCE_CLASSES:
+        validate_allsource_frequency_metadata(metadata)
+    save_frequency_stats(output_path, mean.float().cpu(), std.float().cpu(), metadata=metadata)
     return load_frequency_stats(output_path)

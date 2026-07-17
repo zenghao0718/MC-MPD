@@ -5,7 +5,7 @@ All commands in this document run on AutoDL, not on the local source-editing com
 ## 1. Pull the branch and run acceptance first
 
 ```bash
-cd /root/autodl-tmp/MC-MPD
+cd /root/autodl-tmp/Few-Shot-AIGI-Detector-main
 git fetch origin
 git switch exp-ddfsd-ms-cocoai-transfer-allsource-v1
 git pull --ff-only origin exp-ddfsd-ms-cocoai-transfer-allsource-v1
@@ -13,7 +13,7 @@ git rev-parse HEAD
 bash scripts/validate_ms_cocoai_transfer_code.sh --code-only
 ```
 
-The default mode is also `code-only`. It checks the branch/commit, required imports, Python compilation, shell syntax, and pytest. It does not touch datasets and never starts training or formal inference. `--data-smoke` additionally checks the seven GenImage train directories and all ten MS COCOAI Parquet shards before its truncated extraction.
+The default mode is also `code-only`. It checks the branch/commit, required imports, Python compilation, shell syntax, and pytest. It does not touch datasets and never starts training or formal inference. `--data-smoke` additionally checks the seven GenImage train directories and all ten MS COCOAI Parquet shards, then processes the complete 9,000-row Validation split.
 
 Optional data smoke (still no training/inference):
 
@@ -21,12 +21,12 @@ Optional data smoke (still no training/inference):
 bash scripts/validate_ms_cocoai_transfer_code.sh --data-smoke
 ```
 
-The data-smoke extraction is intentionally truncated and grouping anomalies caused by truncation are recorded/allowed. Full grouping below must run without `--allow_anomalies`.
+The data-smoke requires exactly 9,000 extracted rows, 1,500 valid groups, zero anomaly rows, a DALL-E 3 seed-42 manifest with 10+10 support and 100+100 query, and a valid manifest SHA lock. It never uses `--allow_anomalies`.
 
 ## 2. Build the formal image/manifests
 
 ```bash
-EXTRACT_ROOT=/root/autodl-tmp/MS_COCOAI_extracted
+EXTRACT_ROOT=/root/autodl-tmp/MS_COCOAI
 
 python tools/extract_ms_cocoai_parquet.py \
   --input_root /root/autodl-tmp/MS_COCOAI \
@@ -57,11 +57,30 @@ python tools/build_ms_cocoai_fewshot_manifests.py \
   --grouped_manifest "$EXTRACT_ROOT/manifests/test/all_rows_grouped.csv" \
   --output_dir "$EXTRACT_ROOT/manifests/test/fewshot" \
   --split test
+
+python tools/build_ms_cocoai_fewshot_manifests.py \
+  --verify_lock "$EXTRACT_ROOT/manifests/validation/fewshot/manifest_lock.json"
+
+python tools/build_ms_cocoai_fewshot_manifests.py \
+  --verify_lock "$EXTRACT_ROOT/manifests/test/fewshot/manifest_lock.json"
 ```
 
-Acceptance targets, which must be checked rather than hard-coded, are 9,000/45,000 rows and 1,500/7,500 valid groups for validation/test. `group_anomalies.csv` must contain no anomalies for full data.
+Acceptance targets, which must be checked rather than bypassed, are 9,000/45,000 rows and 1,500/7,500 valid groups for validation/test. `group_anomalies.csv` must contain no anomalies for full data. Preserve `manifest_lock.json` and `manifest_sha256.txt`; DDFSD and later baselines must validate the lock before running.
 
-## 3. Train all-source in screen
+## 3. Prepare provenance-bound stats, then train in screen
+
+Prepare or verify the all-source GenImage-train statistics before training:
+
+```bash
+mkdir -p /root/autodl-tmp/runs/transfer_ms_cocoai/train/ddfsd_allsource_full_step15000
+screen -S ms_cocoai_allsource_stats
+python tools/prepare_ddfsd_allsource_freq_stats.py \
+  --data_root /root/autodl-tmp/data_fsd_full/GenImage \
+  --output_path /root/autodl-tmp/runs/transfer_ms_cocoai/train/ddfsd_allsource_full_step15000/freq_stats_allsource.pt \
+  2>&1 | tee /root/autodl-tmp/runs/transfer_ms_cocoai/train/ddfsd_allsource_full_step15000/prepare_freq_stats.log
+```
+
+The stats file contains `mean`, `std`, and metadata for the fixed ordered classes `real, ADM, BigGAN, glide, Midjourney, SD, VQDM`; its `.sha256` sidecar is verified on reuse. The training script refuses to auto-compute or run without this file. Saved checkpoints bind the exact stats SHA and metadata.
 
 ```bash
 screen -S ms_cocoai_allsource_train
@@ -89,7 +108,7 @@ Only `ckpt/ddfsd_step[15000].pth` is used for formal transfer.
 
 ```bash
 screen -S ms_cocoai_dalle3_smoke
-bash scripts/run_ms_cocoai_ddfsd_smoke.sh 2>&1 | tee /root/autodl-tmp/runs/transfer_ms_cocoai/smoke/validation/dalle3/seed_42/eval.log
+bash scripts/run_ms_cocoai_ddfsd_smoke.sh 2>&1 | tee /root/autodl-tmp/runs/transfer_ms_cocoai/smoke/validation/dalle3_seed42.log
 ```
 
 After smoke acceptance:
@@ -99,7 +118,7 @@ screen -S ms_cocoai_formal_test
 bash scripts/run_ms_cocoai_ddfsd_formal.sh 2>&1 | tee /root/autodl-tmp/runs/transfer_ms_cocoai/formal/test/formal.log
 ```
 
-The formal output is split by generator and seed. Do not mix per-task outputs in one directory.
+The formal output is split by generator and seed. Do not mix per-task outputs in one directory. Each evaluator task validates the checkpoint/stats binding and its two manifests against the lock. A complete existing result with identical provenance is safely skipped; a mismatch fails. Use evaluator `--overwrite` only for an intentional replacement after reviewing the printed old/new provenance differences. Formal shell scripts never pass it by default.
 
 ## 5. Required result comparison
 

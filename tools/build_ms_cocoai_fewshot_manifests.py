@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create fixed MS COCOAI 10-shot support/query manifests."""
+"""Create or verify frozen MS COCOAI 10-shot support/query manifests."""
 
 import argparse
 import csv
@@ -7,6 +7,7 @@ import hashlib
 import json
 import random
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -24,6 +25,19 @@ def choose_support_groups(group_ids, master_seed, count):
         raise ValueError(f"Need at least {count} complete groups, got {len(ordered)}")
     random.Random(master_seed).shuffle(ordered)
     return ordered[:count], ordered[count:]
+
+
+def partition_support_groups(support_pool, seeds=SEEDS, groups_per_seed=10):
+    required = len(seeds) * groups_per_seed
+    if len(support_pool) != required or len(set(support_pool)) != required:
+        raise ValueError(f"Support pool must contain exactly {required} unique groups.")
+    partition = {
+        seed: list(support_pool[index * groups_per_seed:(index + 1) * groups_per_seed])
+        for index, seed in enumerate(seeds)
+    }
+    if len(set().union(*(set(value) for value in partition.values()))) != required:
+        raise ValueError("Seed support-group sets are not mutually disjoint.")
+    return partition
 
 
 def sha256_file(path):
@@ -67,9 +81,8 @@ def write_manifest(path, rows):
     if not rows:
         raise ValueError(f"Refusing to write empty manifest: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0])
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -82,56 +95,104 @@ def load_complete_groups(path):
             if label in groups[row["group_id"]]:
                 raise ValueError(f"Duplicate Label_B={label} in group {row['group_id']}")
             groups[row["group_id"]][label] = row
-    invalid = [group_id for group_id, items in groups.items() if set(items) != set(range(6))]
+    invalid = []
+    for group_id, items in groups.items():
+        hashes = [row["image_sha256"] for row in items.values()]
+        if set(items) != set(range(6)) or len(set(hashes)) != 6:
+            invalid.append(group_id)
     if invalid:
-        raise ValueError(f"Grouped manifest contains incomplete groups, first={invalid[:5]}")
+        raise ValueError(f"Grouped manifest contains incomplete/SHA-duplicate groups, first={invalid[:5]}")
     return dict(groups)
 
 
 def validate_task(support, query):
-    support_paths = {row["image_path"] for row in support}
-    query_paths = {row["image_path"] for row in query}
-    if support_paths & query_paths:
-        raise ValueError("Support/query image paths overlap.")
-    support_groups = {row["group_id"] for row in support}
-    query_groups = {row["group_id"] for row in query}
-    if support_groups & query_groups:
-        raise ValueError("Support/query group IDs overlap.")
     for name, rows in (("support", support), ("query", query)):
+        paths = [row["image_path"] for row in rows]
+        hashes = [row["image_sha256"] for row in rows]
+        if len(set(paths)) != len(paths):
+            raise ValueError(f"{name} contains duplicate image paths.")
+        if len(set(hashes)) != len(hashes):
+            raise ValueError(f"{name} contains duplicate image SHA-256 values.")
         labels = [int(row["label"]) for row in rows]
         if labels.count(0) != labels.count(1):
             raise ValueError(f"{name} real/fake counts are not balanced.")
+    support_labels = [int(row["label"]) for row in support]
+    if support_labels.count(0) != 10 or support_labels.count(1) != 10:
+        raise ValueError("Support must contain exactly 10 real + 10 fake images.")
+    checks = (
+        ("image paths", {row["image_path"] for row in support}, {row["image_path"] for row in query}),
+        ("group IDs", {row["group_id"] for row in support}, {row["group_id"] for row in query}),
+        ("image SHA-256", {row["image_sha256"] for row in support}, {row["image_sha256"] for row in query}),
+    )
+    for label, support_values, query_values in checks:
+        if support_values & query_values:
+            raise ValueError(f"Support/query {label} overlap.")
+
+
+def _file_record(path):
+    resolved = Path(path).resolve()
+    return {"path": str(resolved), "sha256": sha256_file(resolved)}
+
+
+def verify_manifest_lock(lock_path):
+    lock_path = Path(lock_path).resolve()
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    for record in lock.get("files", []):
+        path = Path(record["path"])
+        if not path.is_file():
+            raise FileNotFoundError(f"Locked manifest file is missing: {path}")
+        actual = sha256_file(path)
+        if actual != record["sha256"]:
+            raise RuntimeError(f"Manifest lock SHA mismatch: {path}: {actual} != {record['sha256']}")
+    freeze_path = lock_path.parent / "manifest_sha256.txt"
+    if not freeze_path.is_file():
+        raise FileNotFoundError(f"Missing manifest SHA freeze file: {freeze_path}")
+    frozen = {}
+    for line in freeze_path.read_text(encoding="utf-8").splitlines():
+        digest, path = line.split("  ", 1)
+        frozen[str(Path(path).resolve())] = digest
+    expected = {record["path"]: record["sha256"] for record in lock["files"]}
+    expected[str(lock_path)] = sha256_file(lock_path)
+    if frozen != expected:
+        raise RuntimeError("manifest_sha256.txt does not exactly match manifest_lock.json and its files.")
+    return lock
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--grouped_manifest")
+    parser.add_argument("--output_dir")
+    parser.add_argument("--split", choices=["validation", "test"])
+    parser.add_argument("--master_seed", type=int, default=20260717)
+    parser.add_argument("--verify_lock")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--grouped_manifest", required=True)
-    parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--split", required=True, choices=["validation", "test"])
-    parser.add_argument("--master_seed", type=int, default=20260717)
-    args = parser.parse_args()
+    args = parse_args()
+    if args.verify_lock:
+        verify_manifest_lock(args.verify_lock)
+        print(f"Manifest lock verified: {Path(args.verify_lock).resolve()}")
+        return
+    if not args.grouped_manifest or not args.output_dir or not args.split:
+        raise ValueError("Generation requires --grouped_manifest, --output_dir, and --split.")
+
     groups = load_complete_groups(args.grouped_manifest)
-    output_dir = Path(args.output_dir)
-    index_rows = []
+    output_dir = Path(args.output_dir).resolve()
+    index_rows, manifest_paths = [], []
+    created_at = datetime.now(timezone.utc).isoformat()
 
     if args.split == "test":
         support_pool, query_group_ids = choose_support_groups(groups, args.master_seed, 50)
-        support_by_seed = {
-            seed: support_pool[index * 10:(index + 1) * 10]
-            for index, seed in enumerate(SEEDS)
-        }
-        if len(set().union(*(set(value) for value in support_by_seed.values()))) != 50:
-            raise AssertionError("The five seed support-group sets are not disjoint.")
-        query_signatures = {}
-        real_query_signature = None
+        support_by_seed = partition_support_groups(support_pool)
+        query_signatures, real_query_signature = {}, None
         for generator, fake_label in GENERATORS.items():
             for seed in SEEDS:
                 support = task_rows(groups, support_by_seed[seed], fake_label, "support", generator, seed)
                 query = task_rows(groups, query_group_ids, fake_label, "query", generator, seed)
                 validate_task(support, query)
                 signature = tuple((row["group_id"], row["label_b"], row["image_sha256"]) for row in query)
-                previous = query_signatures.setdefault(generator, signature)
-                if previous != signature:
+                if query_signatures.setdefault(generator, signature) != signature:
                     raise AssertionError(f"Query differs across seeds for {generator}")
                 current_real = tuple(row["image_sha256"] for row in query if int(row["label"]) == 0)
                 if real_query_signature is None:
@@ -142,52 +203,90 @@ def main():
                 support_path, query_path = task_dir / "support.csv", task_dir / "query.csv"
                 write_manifest(support_path, support)
                 write_manifest(query_path, query)
+                manifest_paths.extend([support_path, query_path])
                 index_rows.append({
-                    "split": args.split, "generator": generator, "display_name": DISPLAY_NAMES[generator],
-                    "seed": seed, "support_manifest": str(support_path.resolve()),
-                    "query_manifest": str(query_path.resolve()), "support_groups": 10,
-                    "real_query": len(query) // 2, "fake_query": len(query) // 2,
+                    "split": args.split, "generator": generator,
+                    "display_name": DISPLAY_NAMES[generator], "seed": seed,
+                    "support_manifest": str(support_path), "query_manifest": str(query_path),
+                    "support_groups": 10, "real_query": len(query) // 2,
+                    "fake_query": len(query) // 2,
                 })
+        verify_rows(row for group_rows in groups.values() for row in group_rows.values())
     else:
-        shuffled, remaining = choose_support_groups(groups, args.master_seed, 10)
+        support_pool, remaining = choose_support_groups(groups, args.master_seed, 10)
+        support_by_seed = {42: support_pool}
         if len(remaining) < 100:
             raise ValueError(f"Validation smoke needs 100 query groups, got {len(remaining)}")
         query_group_ids = remaining[:100]
         generator, seed = "dalle3", 42
-        support = task_rows(groups, shuffled, GENERATORS[generator], "support", generator, seed)
+        support = task_rows(groups, support_pool, GENERATORS[generator], "support", generator, seed)
         query = task_rows(groups, query_group_ids, GENERATORS[generator], "query", generator, seed)
         validate_task(support, query)
         task_dir = output_dir / generator / f"seed_{seed}"
         support_path, query_path = task_dir / "support.csv", task_dir / "query.csv"
         write_manifest(support_path, support)
         write_manifest(query_path, query)
+        manifest_paths.extend([support_path, query_path])
         index_rows.append({
-            "split": args.split, "generator": generator, "display_name": DISPLAY_NAMES[generator],
-            "seed": seed, "support_manifest": str(support_path.resolve()),
-            "query_manifest": str(query_path.resolve()), "support_groups": 10,
-            "real_query": 100, "fake_query": 100,
+            "split": args.split, "generator": generator,
+            "display_name": DISPLAY_NAMES[generator], "seed": seed,
+            "support_manifest": str(support_path), "query_manifest": str(query_path),
+            "support_groups": 10, "real_query": 100, "fake_query": 100,
         })
-
-    if args.split == "test":
-        verify_rows(
-            row for group_rows in groups.values() for row in group_rows.values()
-        )
-    else:
         verify_rows(support + query)
-    write_manifest(output_dir / "manifest_index.csv", index_rows)
+
+    index_path = output_dir / "manifest_index.csv"
+    support_groups_path = output_dir / "support_pool_groups.csv"
+    query_groups_path = output_dir / "query_groups.csv"
+    provenance_path = output_dir / "manifest_provenance.json"
+    write_manifest(index_path, index_rows)
+    write_manifest(support_groups_path, [
+        {"seed": seed, "support_rank": rank, "group_id": group_id}
+        for seed, group_ids in support_by_seed.items()
+        for rank, group_id in enumerate(group_ids)
+    ])
+    write_manifest(query_groups_path, [
+        {"query_rank": rank, "group_id": group_id}
+        for rank, group_id in enumerate(query_group_ids)
+    ])
     provenance = {
+        "created_at_utc": created_at,
         "grouped_manifest": str(Path(args.grouped_manifest).resolve()),
         "grouped_manifest_sha256": sha256_file(args.grouped_manifest),
         "split": args.split,
         "master_seed": args.master_seed,
         "seeds": list(SEEDS) if args.split == "test" else [42],
+        "generators": list(GENERATORS) if args.split == "test" else ["dalle3"],
         "support_shot_per_class": 10,
         "file_sha_verification": True,
         "num_tasks": len(index_rows),
     }
-    with (output_dir / "manifest_provenance.json").open("w", encoding="utf-8") as handle:
-        json.dump(provenance, handle, indent=2, ensure_ascii=False)
-    print(f"Wrote and verified {len(index_rows)} tasks under {output_dir}")
+    provenance_path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
+
+    locked_paths = [
+        Path(args.grouped_manifest), index_path, provenance_path,
+        support_groups_path, query_groups_path, *manifest_paths,
+    ]
+    lock = {
+        "split": args.split,
+        "master_seed": args.master_seed,
+        "seeds": list(SEEDS) if args.split == "test" else [42],
+        "generators": list(GENERATORS) if args.split == "test" else ["dalle3"],
+        "support_groups": {str(seed): values for seed, values in support_by_seed.items()},
+        "query_groups": query_group_ids,
+        "created_at_utc": created_at,
+        "files": [_file_record(path) for path in locked_paths],
+    }
+    lock_path = output_dir / "manifest_lock.json"
+    lock_path.write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    freeze_records = list(lock["files"]) + [_file_record(lock_path)]
+    freeze_path = output_dir / "manifest_sha256.txt"
+    freeze_path.write_text(
+        "".join(f"{record['sha256']}  {record['path']}\n" for record in freeze_records),
+        encoding="utf-8",
+    )
+    verify_manifest_lock(lock_path)
+    print(f"Wrote and locked {len(index_rows)} tasks under {output_dir}")
 
 
 if __name__ == "__main__":

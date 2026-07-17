@@ -79,6 +79,15 @@ def build_groups(rows):
                     "label_counts": ";".join(f"{key}:{value}" for key, value in counts.items()),
                 })
                 continue
+            image_hashes = [row["image_sha256"] for row in aligned]
+            if len(set(image_hashes)) != 6:
+                anomalies.append({
+                    "caption_sha256": expected_sha,
+                    "caption": caption,
+                    "reason": f"group {group_id} contains duplicate image_sha256 values",
+                    "label_counts": ";".join(f"{key}:{value}" for key, value in counts.items()),
+                })
+                continue
             group_record = {
                 "group_id": group_id,
                 "caption_sha256": expected_sha,

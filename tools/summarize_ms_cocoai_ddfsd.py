@@ -41,6 +41,11 @@ def main():
             rows = list(csv.DictReader(handle))
         if not rows:
             raise ValueError(f"Empty score file: {score_file}")
+        formal_values = {str(row.get("formal_result", "")).lower() for row in rows}
+        if formal_values != {"true"}:
+            raise ValueError(
+                f"Refusing to summarize non-formal or unlabeled results: {score_file}: {formal_values}"
+            )
         keys = {(row["target_generator"], int(row["seed"])) for row in rows}
         if len(keys) != 1:
             raise ValueError(f"Score file mixes tasks: {score_file}: {keys}")
@@ -118,6 +123,7 @@ def main():
         "macro": "equal-weight mean over five generator means",
         "checkpoint_sha256": next(iter(checkpoint_hashes)),
         "frequency_stats_sha256": next(iter(frequency_hashes)),
+        "formal_results_only": True,
     }
     (output_dir / "summary_provenance.json").write_text(
         json.dumps(provenance, indent=2), encoding="utf-8"

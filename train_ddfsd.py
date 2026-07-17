@@ -103,7 +103,8 @@ def load_runtime_dependencies():
     global np, torch, dist, GradScaler, autocast, LambdaLR, StepLR, SummaryWriter
     global logger, build_train_iterators, resolve_train_fake_classes, validate_generator_name
     global DDFSDDualDomainNet, compute_ddfsd_episode_loss, compute_lambda_sep, sample_branch_mode
-    global evaluate_binary_few_shot, compute_frequency_stats, load_frequency_stats, setup_dist
+    global evaluate_binary_few_shot, compute_frequency_stats, load_frequency_stats
+    global sha256_file, validate_allsource_frequency_metadata, setup_dist
 
     import numpy as np
     import torch
@@ -125,7 +126,12 @@ def load_runtime_dependencies():
         sample_branch_mode,
     )
     from util.ddfsd_eval import evaluate_binary_few_shot
-    from util.ddfsd_frequency import compute_frequency_stats, load_frequency_stats
+    from util.ddfsd_frequency import (
+        compute_frequency_stats,
+        load_frequency_stats,
+        sha256_file,
+        validate_allsource_frequency_metadata,
+    )
     from util.utils import setup_dist
 
 
@@ -345,6 +351,16 @@ def validate_resume_config(args, checkpoint):
             mismatches.append(f"{key}: checkpoint={old!r}, current={current!r}")
     if mismatches:
         raise ValueError("Resume configuration mismatch:\n  " + "\n  ".join(mismatches))
+    if args.training_scope == "all-source":
+        checkpoint_stats_sha = checkpoint.get("freq_stats_sha256")
+        if not checkpoint_stats_sha:
+            raise ValueError("All-source strict resume checkpoint has no freq_stats_sha256.")
+        current_stats_sha = sha256_file(args.freq_stats_path)
+        if checkpoint_stats_sha != current_stats_sha:
+            raise ValueError(
+                "All-source strict resume frequency-stat SHA mismatch: "
+                f"checkpoint={checkpoint_stats_sha}, current={current_stats_sha}"
+            )
 
 
 def move_optimizer_state_to_device(optimizer, device):
@@ -374,6 +390,28 @@ def restore_random_states(checkpoint):
 def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimizer, scheduler, scaler):
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, f"{args.model}_step[{step}].pth")
+    freq_stats_sha256 = None
+    freq_stats_metadata = None
+    if args.model_mode != "rgb-only" or args.training_scope == "all-source":
+        if not args.freq_stats_path or not os.path.isfile(args.freq_stats_path):
+            raise FileNotFoundError(
+                "Checkpoint provenance requires the actual frequency-statistics file; "
+                f"missing: {args.freq_stats_path!r}"
+            )
+        stats = load_frequency_stats(args.freq_stats_path)
+        freq_stats_sha256 = sha256_file(args.freq_stats_path)
+        freq_stats_metadata = stats.get("metadata")
+        bound_sha = getattr(args, "freq_stats_sha256", None)
+        bound_metadata = getattr(args, "freq_stats_metadata", None)
+        if bound_sha and bound_sha != freq_stats_sha256:
+            raise RuntimeError(
+                "Frequency-statistics file changed after model initialization: "
+                f"bound={bound_sha}, current={freq_stats_sha256}"
+            )
+        if bound_metadata is not None and bound_metadata != freq_stats_metadata:
+            raise RuntimeError("Frequency-statistics metadata changed after model initialization.")
+        if args.training_scope == "all-source":
+            validate_allsource_frequency_metadata(freq_stats_metadata)
     torch.save(
         {
             "step": step,
@@ -390,6 +428,8 @@ def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimiz
             "source_classes": list(args.source_classes),
             "exclude_class": args.exclude_class if args.training_scope == "leave-one-out" else None,
             "freq_stats_path": args.freq_stats_path if args.model_mode != "rgb-only" else None,
+            "freq_stats_sha256": freq_stats_sha256,
+            "freq_stats_metadata": freq_stats_metadata,
             "resume_from_checkpoint": args.resume_checkpoint or None,
             "resume_from_step": getattr(args, "resume_from_step", 0),
             "resume_target_total_steps": args.total_training_steps,
@@ -404,12 +444,20 @@ def save_ddfsd_checkpoint(output_dir, args, step, effective_step, model, optimiz
 
 
 def prepare_frequency_stats(args):
+    def bind(stats):
+        if args.training_scope == "all-source":
+            validate_allsource_frequency_metadata(stats.get("metadata"))
+        args.freq_stats_sha256 = sha256_file(args.freq_stats_path)
+        args.freq_stats_metadata = stats.get("metadata")
+        return stats
+
     if not args.freq_stats_path:
         filename = "freq_stats_allsource.pt" if args.training_scope == "all-source" else "freq_stats.pt"
         args.freq_stats_path = os.path.join(args.output_dir, filename)
 
     if os.path.exists(args.freq_stats_path):
-        return load_frequency_stats(args.freq_stats_path)
+        stats = load_frequency_stats(args.freq_stats_path)
+        return bind(stats)
 
     if not args.auto_compute_freq_stats:
         raise FileNotFoundError(
@@ -430,7 +478,8 @@ def prepare_frequency_stats(args):
         )
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
-    return load_frequency_stats(args.freq_stats_path)
+    stats = load_frequency_stats(args.freq_stats_path)
+    return bind(stats)
 
 
 def validate_args(args):

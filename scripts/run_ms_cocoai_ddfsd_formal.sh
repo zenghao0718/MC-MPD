@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MANIFEST_ROOT=${MANIFEST_ROOT:-"/root/autodl-tmp/MS_COCOAI_extracted/manifests/test/fewshot"}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+MANIFEST_ROOT=${MANIFEST_ROOT:-"/root/autodl-tmp/MS_COCOAI/manifests/test/fewshot"}
 CKPT_PATH=${CKPT_PATH:-"/root/autodl-tmp/runs/transfer_ms_cocoai/train/ddfsd_allsource_full_step15000/ckpt/ddfsd_step[15000].pth"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"/root/autodl-tmp/runs/transfer_ms_cocoai/train/ddfsd_allsource_full_step15000/freq_stats_allsource.pt"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"/root/autodl-tmp/runs/transfer_ms_cocoai/formal/test"}
 NUM_WORKERS=${NUM_WORKERS:-8}
 GENERATORS=(sd21 sdxl sd3 dalle3 midjourney_v6)
 SEEDS=(42 101 102 103 104)
+MANIFEST_LOCK="${MANIFEST_ROOT}/manifest_lock.json"
 
 [[ -f "${CKPT_PATH}" ]] || { echo "Missing checkpoint: ${CKPT_PATH}" >&2; exit 1; }
 [[ -f "${FREQ_STATS_PATH}" ]] || { echo "Missing frequency stats: ${FREQ_STATS_PATH}" >&2; exit 1; }
+[[ -f "${MANIFEST_LOCK}" ]] || { echo "Missing manifest lock: ${MANIFEST_LOCK}" >&2; exit 1; }
+python tools/build_ms_cocoai_fewshot_manifests.py --verify_lock "${MANIFEST_LOCK}"
 for generator in "${GENERATORS[@]}"; do
     for seed in "${SEEDS[@]}"; do
         task_root="${MANIFEST_ROOT}/${generator}/seed_${seed}"
@@ -23,6 +30,7 @@ for generator in "${GENERATORS[@]}"; do
             --target_generator "${generator}" \
             --support_manifest "${task_root}/support.csv" \
             --query_manifest "${task_root}/query.csv" \
+            --manifest_lock "${MANIFEST_LOCK}" \
             --ckpt_path "${CKPT_PATH}" \
             --freq_stats_path "${FREQ_STATS_PATH}" \
             --output_dir "${output_dir}" \

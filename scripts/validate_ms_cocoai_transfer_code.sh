@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 MODE="code-only"
 if [[ $# -gt 1 ]]; then
     echo "Usage: $0 [--code-only|--data-smoke]" >&2
@@ -36,6 +40,7 @@ PYTHON_FILES=(
     tools/build_ms_cocoai_groups.py
     tools/build_ms_cocoai_fewshot_manifests.py
     tools/summarize_ms_cocoai_ddfsd.py
+    tools/prepare_ddfsd_allsource_freq_stats.py
     tests/test_ms_cocoai_logic.py
 )
 python -m py_compile "${PYTHON_FILES[@]}"
@@ -64,22 +69,49 @@ if [[ "${MODE}" == "data-smoke" ]]; then
     test_parquet=("${MS_COCOAI_ROOT}"/test/test-*.parquet)
     [[ ${#validation_parquet[@]} -eq 2 ]] || { echo "Expected 2 validation Parquet shards" >&2; exit 1; }
     [[ ${#test_parquet[@]} -eq 8 ]] || { echo "Expected 8 test Parquet shards" >&2; exit 1; }
-    SMOKE_ROOT=${SMOKE_ROOT:-"/root/autodl-tmp/runs/transfer_ms_cocoai/acceptance/data_smoke"}
-    SMOKE_MAX_ROWS=${SMOKE_MAX_ROWS:-3000}
     python tools/extract_ms_cocoai_parquet.py \
         --input_root "${MS_COCOAI_ROOT}" \
-        --output_root "${SMOKE_ROOT}" \
+        --output_root "${MS_COCOAI_ROOT}" \
         --split validation \
-        --max_rows "${SMOKE_MAX_ROWS}" \
         --verify_existing
     python tools/build_ms_cocoai_groups.py \
-        --base_manifest "${SMOKE_ROOT}/manifests/validation/base_rows.csv" \
-        --output_dir "${SMOKE_ROOT}/manifests/validation" \
-        --allow_anomalies
+        --base_manifest "${MS_COCOAI_ROOT}/manifests/validation/base_rows.csv" \
+        --output_dir "${MS_COCOAI_ROOT}/manifests/validation"
+    python - "${MS_COCOAI_ROOT}/manifests/validation" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+def count_rows(name):
+    with (root / name).open(newline="", encoding="utf-8") as handle:
+        return sum(1 for _ in csv.DictReader(handle))
+
+assert count_rows("base_rows.csv") == 9000, "Validation extraction must contain 9000 rows"
+assert count_rows("groups.csv") == 1500, "Validation must contain 1500 valid groups"
+assert count_rows("group_anomalies.csv") == 0, "Validation grouping must have zero anomalies"
+PY
     python tools/build_ms_cocoai_fewshot_manifests.py \
-        --grouped_manifest "${SMOKE_ROOT}/manifests/validation/all_rows_grouped.csv" \
-        --output_dir "${SMOKE_ROOT}/manifests/validation/fewshot" \
+        --grouped_manifest "${MS_COCOAI_ROOT}/manifests/validation/all_rows_grouped.csv" \
+        --output_dir "${MS_COCOAI_ROOT}/manifests/validation/fewshot" \
         --split validation
+    python - "${MS_COCOAI_ROOT}/manifests/validation/fewshot/dalle3/seed_42" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+def labels(name):
+    with (root / name).open(newline="", encoding="utf-8") as handle:
+        return [int(row["label"]) for row in csv.DictReader(handle)]
+
+support = labels("support.csv")
+query = labels("query.csv")
+assert support.count(0) == support.count(1) == 10, "Smoke support must be 10 real + 10 fake"
+assert query.count(0) == query.count(1) == 100, "Smoke query must be 100 real + 100 fake"
+PY
+    python tools/build_ms_cocoai_fewshot_manifests.py \
+        --verify_lock "${MS_COCOAI_ROOT}/manifests/validation/fewshot/manifest_lock.json"
 fi
 
 echo "Validation mode ${MODE} completed. No training or formal inference was started."

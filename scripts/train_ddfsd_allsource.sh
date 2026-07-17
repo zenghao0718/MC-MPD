@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 export HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 DATA_ROOT=${DATA_ROOT:-"/root/autodl-tmp/data_fsd_full/GenImage"}
 OUTPUT_PATH=${OUTPUT_PATH:-"/root/autodl-tmp/runs/transfer_ms_cocoai/train/ddfsd_allsource_full_step15000"}
@@ -11,7 +15,16 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 SEED=${SEED:-42}
 BATCH_SIZE=${BATCH_SIZE:-16}
 
+[[ "${GPU_NUM}" -eq 1 ]] || {
+    echo "DDFSD v1 all-source training only supports one GPU." >&2
+    exit 1
+}
 [[ -d "${DATA_ROOT}" ]] || { echo "DATA_ROOT does not exist: ${DATA_ROOT}" >&2; exit 1; }
+[[ -f "${FREQ_STATS_PATH}" ]] || {
+    echo "Missing provenance-validated all-source stats: ${FREQ_STATS_PATH}" >&2
+    echo "Run tools/prepare_ddfsd_allsource_freq_stats.py before training." >&2
+    exit 1
+}
 if [[ -d "${OUTPUT_PATH}/ckpt" ]] && find "${OUTPUT_PATH}/ckpt" -maxdepth 1 -name '*.pth' -print -quit | grep -q .; then
     echo "Refusing to overwrite checkpoints in ${OUTPUT_PATH}/ckpt" >&2
     exit 1
@@ -32,7 +45,7 @@ OMP_NUM_THREADS=1 torchrun --nproc_per_node "${GPU_NUM}" --nnodes 1 train_ddfsd.
     --data_root "${DATA_ROOT}" \
     --output_dir "${OUTPUT_PATH}" \
     --freq_stats_path "${FREQ_STATS_PATH}" \
-    --auto_compute_freq_stats True \
+    --auto_compute_freq_stats False \
     --num_workers "${NUM_WORKERS}" \
     --seed "${SEED}" \
     --batch_size "${BATCH_SIZE}" \
