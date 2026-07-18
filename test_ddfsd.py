@@ -70,6 +70,8 @@ def load_runtime_dependencies():
 
 
 def load_checkpoint(path: str):
+    import torch
+
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"DDFSD checkpoint has no 'model' key: {path}")
