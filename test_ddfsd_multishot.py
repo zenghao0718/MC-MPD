@@ -202,7 +202,7 @@ def main():
                "branch_mode": branch_mode, "exclude_class": args.exclude_class, "shot": shot,
                "ckpt_step": ckpt_step, "eval_seeds": ",".join(map(str, seeds)),
                "freq_stats_path": args.freq_stats_path, "ckpt_path": args.ckpt_path}
-        for metric in ("acc", "ap", "auc"):
+        for metric in ("acc", "real_acc", "fake_acc", "balanced_acc", "ap", "auc"):
             row[f"{metric}_mean"], row[f"{metric}_std"] = _mean_std(group, metric)
         alpha = [r for r in group if r["alpha_mean"] != ""]
         row["alpha_mean"] = statistics.mean(float(r["alpha_mean"]) for r in alpha) if alpha else ""
@@ -211,11 +211,13 @@ def main():
         summary_rows.append(row)
 
     per_fields = ["checkpoint_model_mode", "model_mode", "branch_mode", "exclude_class", "seed", "shot",
-                  "ckpt_step", "acc", "ap", "auc", "num_real_support", "num_fake_support",
+                  "ckpt_step", "acc", "real_acc", "fake_acc", "balanced_acc", "ap", "auc", "num_real_support", "num_fake_support",
                   "num_real_query", "num_fake_query", "alpha_mean", "alpha_min", "alpha_max",
                   "zero_shot_metadata_per_class", "freq_stats_path", "ckpt_path"]
     summary_fields = ["checkpoint_model_mode", "model_mode", "branch_mode", "exclude_class", "shot",
-                      "ckpt_step", "acc_mean", "acc_std", "ap_mean", "ap_std", "auc_mean", "auc_std",
+                      "ckpt_step", "acc_mean", "acc_std", "real_acc_mean", "real_acc_std",
+                      "fake_acc_mean", "fake_acc_std", "balanced_acc_mean", "balanced_acc_std",
+                      "ap_mean", "ap_std", "auc_mean", "auc_std",
                       "alpha_mean", "alpha_min", "alpha_max", "eval_seeds", "freq_stats_path", "ckpt_path"]
     write_csv(os.path.join(args.output_dir, "multishot_per_seed.csv"), per_seed_rows, per_fields)
     write_csv(os.path.join(args.output_dir, "multishot_summary.csv"), summary_rows, summary_fields)

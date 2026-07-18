@@ -1,11 +1,15 @@
 import tempfile
 import unittest
 
-import torch
+try:
+    import torch
+    from test_ddfsd import load_checkpoint
+except ModuleNotFoundError:
+    torch = None
+    load_checkpoint = None
 
-from test_ddfsd import load_checkpoint
 
-
+@unittest.skipUnless(torch is not None, "torch is unavailable in this Python environment")
 class CheckpointLoadingTest(unittest.TestCase):
     def test_load_checkpoint_without_runtime_dependencies(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,6 +1,7 @@
 """Few-shot binary evaluation helpers for DDFSD."""
 
-from typing import Dict, List
+import math
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -22,11 +23,30 @@ def binary_metrics(labels: List[int], fake_scores: List[float], preds: List[int]
     labels_np = np.asarray(labels, dtype=np.int64)
     scores_np = np.asarray(fake_scores, dtype=np.float64)
     preds_np = np.asarray(preds, dtype=np.int64)
-    return {
+    if not (labels_np.size == scores_np.size == preds_np.size) or labels_np.size == 0:
+        raise ValueError("labels, fake_scores, and preds must have the same non-zero length.")
+    if set(labels_np.tolist()) != {0, 1}:
+        raise ValueError("Binary metrics require both real (0) and fake (1) query labels.")
+    if not np.isfinite(scores_np).all():
+        raise ValueError("fake_scores must contain only finite values.")
+    if not set(preds_np.tolist()).issubset({0, 1}):
+        raise ValueError("Binary predictions must contain only 0 (real) or 1 (fake).")
+
+    real_mask = labels_np == 0
+    fake_mask = labels_np == 1
+    real_acc = float((preds_np[real_mask] == labels_np[real_mask]).mean())
+    fake_acc = float((preds_np[fake_mask] == labels_np[fake_mask]).mean())
+    metrics = {
         "acc": float((preds_np == labels_np).mean()),
+        "real_acc": real_acc,
+        "fake_acc": fake_acc,
+        "balanced_acc": (real_acc + fake_acc) / 2.0,
         "ap": float(average_precision_score(labels_np, scores_np)),
         "auc": float(roc_auc_score(labels_np, scores_np)),
     }
+    if not all(math.isfinite(value) for value in metrics.values()):
+        raise ValueError(f"Binary metrics produced a non-finite value: {metrics}")
+    return metrics
 
 
 def encode_batch(model, images: torch.Tensor, device: torch.device, use_fp16: bool):
@@ -59,7 +79,8 @@ def evaluate_binary_few_shot(
     max_query_per_class: int = 0,
     model_mode: str = "dual",
     branch_mode: str = None,
-) -> Dict[str, float]:
+    return_indices: bool = False,
+) -> Dict[str, Any]:
     """Evaluate real-vs-fake with fixed support and remaining val images as query."""
 
     if model_mode not in VALID_MODEL_MODES:
@@ -145,6 +166,22 @@ def evaluate_binary_few_shot(
             "num_fake_support": len(fake_support_idx),
             "num_real_query": len(real_query_idx),
             "num_fake_query": len(fake_query_idx),
+            "alpha_mean": float(alpha.detach().float().mean().cpu()) if alpha is not None else "",
+            "alpha_min": float(alpha.detach().float().min().cpu()) if alpha is not None else "",
+            "alpha_max": float(alpha.detach().float().max().cpu()) if alpha is not None else "",
         }
     )
+    if return_indices:
+        metrics["sampling"] = {
+            "real": {
+                "support_indices": list(real_support_idx),
+                "query_indices": list(real_query_idx),
+                "paths": list(real_dataset.paths),
+            },
+            fake_class: {
+                "support_indices": list(fake_support_idx),
+                "query_indices": list(fake_query_idx),
+                "paths": list(fake_dataset.paths),
+            },
+        }
     return metrics

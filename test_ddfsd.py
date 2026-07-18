@@ -3,8 +3,14 @@
 
 import argparse
 import csv
+import json
 import os
 import statistics
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+from util.ddfsd_multishot_logic import resolve_checkpoint_step
 
 
 def str2bool(value):
@@ -49,6 +55,18 @@ def parse_args():
     parser.add_argument("--eval_seeds", type=str, default="42,101,102,103,104")
     parser.add_argument("--eval_batch_size", type=int, default=128)
     parser.add_argument("--max_eval_query_per_class", type=int, default=0)
+    parser.add_argument(
+        "--save_manifest",
+        type=str2bool,
+        default=False,
+        help="Save the exact support/query indices used by this main-protocol evaluation.",
+    )
+    parser.add_argument(
+        "--manifest_path",
+        type=str,
+        default="",
+        help="Manifest destination; defaults to OUTPUT_DIR/support_query_manifest.csv.",
+    )
 
     parser.add_argument("--tau", type=float, default=0.2)
     parser.add_argument("--tau_r", type=float, default=0.1)
@@ -119,6 +137,50 @@ def write_csv(path: str, rows, fieldnames):
         writer.writerows(rows)
 
 
+def git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def sampling_manifest_rows(exclude_class, seed, shot, sampling):
+    rows = []
+    for data_class in ("real", exclude_class):
+        selected = sampling[data_class]
+        for rank, index in enumerate(selected["support_indices"], 1):
+            rows.append(
+                {
+                    "exclude_class": exclude_class,
+                    "seed": seed,
+                    "shot": shot,
+                    "data_class": data_class,
+                    "split": "val",
+                    "dataset_index": index,
+                    "filepath": selected["paths"][index],
+                    "role": "support",
+                    "support_rank": rank,
+                }
+            )
+        for index in selected["query_indices"]:
+            rows.append(
+                {
+                    "exclude_class": exclude_class,
+                    "seed": seed,
+                    "shot": shot,
+                    "data_class": data_class,
+                    "split": "val",
+                    "dataset_index": index,
+                    "filepath": selected["paths"][index],
+                    "role": "query",
+                    "support_rank": "",
+                }
+            )
+    return rows
+
+
 def main():
     args = parse_args()
     load_runtime_dependencies()
@@ -162,14 +224,23 @@ def main():
     model = model.to(device)
     model.eval()
 
-    ckpt_step = args.ckpt_step or int(checkpoint.get("step", 0))
+    ckpt_step = resolve_checkpoint_step(
+        args.ckpt_step, int(checkpoint.get("step", 0)), args.ckpt_path
+    )
     seeds = parse_seed_list(args.eval_seeds)
     if args.eval_repeats > 0:
         seeds = seeds[: args.eval_repeats]
     if not seeds:
         raise ValueError("No eval seeds were provided.")
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("Duplicate eval seeds are not allowed.")
+    if args.num_support_test <= 0:
+        raise ValueError("test_ddfsd.py main-protocol evaluation requires num_support_test > 0.")
+    if args.max_eval_query_per_class < 0:
+        raise ValueError("max_eval_query_per_class must be non-negative.")
 
     per_seed_rows = []
+    manifest_rows = []
     for seed in seeds:
         metrics = evaluate_binary_few_shot(
             model=model,
@@ -186,6 +257,7 @@ def main():
             max_query_per_class=args.max_eval_query_per_class,
             model_mode=model_mode,
             branch_mode=branch_mode,
+            return_indices=args.save_manifest,
         )
         row = {
             "checkpoint_model_mode": model_mode,
@@ -197,22 +269,41 @@ def main():
             "split": "val",
             "ckpt_step": ckpt_step,
             "acc": metrics["acc"],
+            "real_acc": metrics["real_acc"],
+            "fake_acc": metrics["fake_acc"],
+            "balanced_acc": metrics["balanced_acc"],
             "ap": metrics["ap"],
             "auc": metrics["auc"],
             "num_real_support": metrics["num_real_support"],
             "num_fake_support": metrics["num_fake_support"],
             "num_real_query": metrics["num_real_query"],
             "num_fake_query": metrics["num_fake_query"],
+            "alpha_mean": metrics["alpha_mean"],
+            "alpha_min": metrics["alpha_min"],
+            "alpha_max": metrics["alpha_max"],
             "freq_stats_path": args.freq_stats_path,
             "ckpt_path": args.ckpt_path,
         }
         per_seed_rows.append(row)
+        if args.save_manifest:
+            manifest_rows.extend(
+                sampling_manifest_rows(
+                    args.exclude_class,
+                    seed,
+                    args.num_support_test,
+                    metrics["sampling"],
+                )
+            )
         logger.info(
-            "DDFSD eval checkpoint_model_mode=%s branch_mode=%s seed=%d: ACC %.6f AP %.6f AUC %.6f",
+            "DDFSD eval checkpoint_model_mode=%s branch_mode=%s seed=%d: "
+            "ACC %.6f Real ACC %.6f Fake ACC %.6f Balanced ACC %.6f AP %.6f AUC %.6f",
             model_mode,
             branch_mode,
             seed,
             metrics["acc"],
+            metrics["real_acc"],
+            metrics["fake_acc"],
+            metrics["balanced_acc"],
             metrics["ap"],
             metrics["auc"],
         )
@@ -223,8 +314,12 @@ def main():
         return statistics.mean(values), std
 
     acc_mean, acc_std = mean_std("acc")
+    real_acc_mean, real_acc_std = mean_std("real_acc")
+    fake_acc_mean, fake_acc_std = mean_std("fake_acc")
+    balanced_acc_mean, balanced_acc_std = mean_std("balanced_acc")
     ap_mean, ap_std = mean_std("ap")
     auc_mean, auc_std = mean_std("auc")
+    alpha_rows = [row for row in per_seed_rows if row["alpha_mean"] != ""]
     summary_rows = [
         {
             "checkpoint_model_mode": model_mode,
@@ -235,10 +330,27 @@ def main():
             "ckpt_step": ckpt_step,
             "acc_mean": acc_mean,
             "acc_std": acc_std,
+            "real_acc_mean": real_acc_mean,
+            "real_acc_std": real_acc_std,
+            "fake_acc_mean": fake_acc_mean,
+            "fake_acc_std": fake_acc_std,
+            "balanced_acc_mean": balanced_acc_mean,
+            "balanced_acc_std": balanced_acc_std,
             "ap_mean": ap_mean,
             "ap_std": ap_std,
             "auc_mean": auc_mean,
             "auc_std": auc_std,
+            "alpha_mean": (
+                statistics.mean(float(row["alpha_mean"]) for row in alpha_rows)
+                if alpha_rows
+                else ""
+            ),
+            "alpha_min": (
+                min(float(row["alpha_min"]) for row in alpha_rows) if alpha_rows else ""
+            ),
+            "alpha_max": (
+                max(float(row["alpha_max"]) for row in alpha_rows) if alpha_rows else ""
+            ),
             "eval_seeds": ",".join(str(seed) for seed in seeds),
             "freq_stats_path": args.freq_stats_path,
             "ckpt_path": args.ckpt_path,
@@ -260,12 +372,18 @@ def main():
             "split",
             "ckpt_step",
             "acc",
+            "real_acc",
+            "fake_acc",
+            "balanced_acc",
             "ap",
             "auc",
             "num_real_support",
             "num_fake_support",
             "num_real_query",
             "num_fake_query",
+            "alpha_mean",
+            "alpha_min",
+            "alpha_max",
             "freq_stats_path",
             "ckpt_path",
         ],
@@ -282,15 +400,74 @@ def main():
             "ckpt_step",
             "acc_mean",
             "acc_std",
+            "real_acc_mean",
+            "real_acc_std",
+            "fake_acc_mean",
+            "fake_acc_std",
+            "balanced_acc_mean",
+            "balanced_acc_std",
             "ap_mean",
             "ap_std",
             "auc_mean",
             "auc_std",
+            "alpha_mean",
+            "alpha_min",
+            "alpha_max",
             "eval_seeds",
             "freq_stats_path",
             "ckpt_path",
         ],
     )
+    if args.save_manifest:
+        manifest_path = args.manifest_path or os.path.join(
+            args.output_dir, "support_query_manifest.csv"
+        )
+        write_csv(
+            manifest_path,
+            manifest_rows,
+            [
+                "exclude_class",
+                "seed",
+                "shot",
+                "data_class",
+                "split",
+                "dataset_index",
+                "filepath",
+                "role",
+                "support_rank",
+            ],
+        )
+        logger.info("Saved support/query manifest: %s", manifest_path)
+
+    config = {
+        "protocol": "main-protocol formal shot ablation",
+        "git_commit": git_commit(),
+        "command": sys.argv,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "exclude_class": args.exclude_class,
+        "shot": args.num_support_test,
+        "seeds": seeds,
+        "data_root": os.path.abspath(args.data_root),
+        "ckpt_path": os.path.abspath(args.ckpt_path),
+        "ckpt_step": ckpt_step,
+        "freq_stats_path": (
+            os.path.abspath(args.freq_stats_path) if args.freq_stats_path else ""
+        ),
+        "checkpoint_model_mode": model_mode,
+        "model_mode": model_mode,
+        "branch_mode": branch_mode,
+        "tau": args.tau,
+        "tau_r": args.tau_r,
+        "max_eval_query_per_class": args.max_eval_query_per_class,
+        "save_manifest": args.save_manifest,
+        "manifest_path": (
+            os.path.abspath(args.manifest_path or os.path.join(args.output_dir, "support_query_manifest.csv"))
+            if args.save_manifest
+            else ""
+        ),
+    }
+    with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
     logger.info(
         "DDFSD summary: ACC %.6f +/- %.6f AP %.6f +/- %.6f AUC %.6f +/- %.6f",
         acc_mean,

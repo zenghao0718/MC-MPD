@@ -1,15 +1,16 @@
 """Datasets and sampling helpers for DDFSD."""
 
 import os
-import random
 import warnings
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Sequence
 
 import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 from torchvision import transforms
+
+from util.ddfsd_sampling import sample_support_query_indices
 
 
 ALL_CLASSES = ["real", "ADM", "BigGAN", "glide", "Midjourney", "SD", "VQDM"]
@@ -171,27 +172,6 @@ def make_subset_loader(
         pin_memory=pin_memory,
         drop_last=False,
     )
-
-
-def sample_support_query_indices(
-    dataset_size: int,
-    support_shot: int,
-    seed: int,
-    max_query: Optional[int] = None,
-) -> Tuple[List[int], List[int]]:
-    if dataset_size <= support_shot:
-        raise ValueError(
-            f"Need more than {support_shot} images to build support/query, got {dataset_size}."
-        )
-
-    indices = list(range(dataset_size))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    support = indices[:support_shot]
-    query = indices[support_shot:]
-    if max_query is not None and max_query > 0:
-        query = query[:max_query]
-    return support, query
 
 
 def build_train_iterators(
