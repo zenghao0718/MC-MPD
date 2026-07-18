@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generic DDFSD branch-mode (dual/rgb-only/freq-only) diagnostic evaluation wrapper.
+# Generic DDFSD branch-mode (dual/single_branch_rgb_train/freq-only) diagnostic evaluation wrapper.
 set -euo pipefail
 
 EXCLUDE_CLASS=${EXCLUDE_CLASS:?EXCLUDE_CLASS is required}

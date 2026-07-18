@@ -13,7 +13,7 @@ be reused. Omitting `--branch_mode` preserves the old behavior by selecting the 
 Single-class smoke-test example (run on AutoDL with real paths):
 
 ```bash
-python test_ddfsd.py --data_root "$DATA_ROOT" --output_dir "$OUTPUT_DIR/rgb-only/exclude_ADM" \
+python test_ddfsd.py --data_root "$DATA_ROOT" --output_dir "$OUTPUT_DIR/single_branch_rgb_train/exclude_ADM" \
   --exclude_class ADM --ckpt_path "$CKPT_PATH" --ckpt_step 15000 --model_mode dual \
   --branch_mode rgb-only --freq_stats_path "$FREQ_STATS_PATH" --num_support_test 10 \
   --eval_repeats 1 --eval_seeds 42 --max_eval_query_per_class 10 --pretrained False

@@ -72,7 +72,7 @@ def parse_int_list(value: str) -> List[int]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="DDFSD branch-mode (dual/rgb-only/freq-only) diagnostic evaluation on the excluded class."
+        description="DDFSD branch-mode (dual/single_branch_rgb_train/freq-only) diagnostic evaluation on the excluded class."
     )
     parser.add_argument("--data_root", type=str, default="/root/autodl-tmp/data")
     parser.add_argument("--output_dir", type=str, required=True, help="Experiment output dir (contains ckpt/, freq_stats.pt)")
@@ -118,7 +118,7 @@ def evaluate_all_branch_modes(
     tau_r: float,
     max_query_per_class: int = 0,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float], Dict[str, int]]:
-    """Evaluate dual/rgb-only/freq-only on one fixed support/query split.
+    """Evaluate dual/single_branch_rgb_train/freq-only on one fixed support/query split.
 
     Returns (metrics_by_branch_mode, sigma_alpha_stats, support_query_counts).
     """

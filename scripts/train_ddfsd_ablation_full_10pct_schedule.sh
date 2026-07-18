@@ -16,7 +16,15 @@ EXCLUDE_CLASS=${EXCLUDE_CLASS:-ADM}
 DATA_ROOT=${DATA_ROOT:-"/root/autodl-tmp/data_fsd_full/GenImage"}
 RUN_ROOT=${RUN_ROOT:-"/root/autodl-tmp/runs/exp-ddfsd-dual-domain-margin-v1"}
 RUN_CONFIG=${RUN_CONFIG:-"ddfsd_ablation_full_steps15000_schedule"}
-OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/${RUN_CONFIG}/${MODEL_MODE}/exclude_${EXCLUDE_CLASS}"}
+if [[ "${MODEL_MODE}" == "rgb-only" ]]; then
+  TRAIN_SUBDIR="single_branch_rgb_train"
+elif [[ "${MODEL_MODE}" == "freq-only" ]]; then
+  TRAIN_SUBDIR="single_branch_freq_train"
+else
+  echo "Unsupported MODEL_MODE: ${MODEL_MODE}" >&2
+  exit 1
+fi
+OUTPUT_PATH=${OUTPUT_PATH:-"${RUN_ROOT}/${RUN_CONFIG}/${TRAIN_SUBDIR}/exclude_${EXCLUDE_CLASS}"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"${RUN_ROOT}/shared_full_freq_stats/exclude_${EXCLUDE_CLASS}/freq_stats.pt"}
 BATCH_SIZE=${BATCH_SIZE:-16}
 

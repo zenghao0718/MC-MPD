@@ -78,7 +78,7 @@ else
 fi
 
 echo "############################################################"
-echo "# [3/6] BRANCH-MODE DIAGNOSIS (dual/rgb-only/freq-only) exclude_class=${EXCLUDE_CLASS}"
+echo "# [3/6] BRANCH-MODE DIAGNOSIS (dual/single_branch_rgb_train/freq-only) exclude_class=${EXCLUDE_CLASS}"
 echo "############################################################"
 mkdir -p "${OUTPUT_PATH}/branch_modes"
 EXCLUDE_CLASS="${EXCLUDE_CLASS}" DATA_ROOT="${DATA_ROOT}" RUN_ROOT="${RUN_ROOT}" \

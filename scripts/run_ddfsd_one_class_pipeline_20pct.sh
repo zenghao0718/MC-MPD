@@ -934,7 +934,7 @@ else
 fi
 
 echo "############################################################"
-echo "# [4/7] BRANCH MODES (dual/rgb-only/freq-only) exclude_class=${EXCLUDE_CLASS}"
+echo "# [4/7] BRANCH MODES (dual/single_branch_rgb_train/freq-only) exclude_class=${EXCLUDE_CLASS}"
 echo "############################################################"
 if run_branch_stage; then
     status_append "branch_modes_status=OK"
