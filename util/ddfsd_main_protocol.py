@@ -62,6 +62,14 @@ def build_valid_image_indices(
     return valid
 
 
+def audit_image_paths(
+    paths: Sequence[str], data_class: str, split: str
+) -> List[Dict[str, object]]:
+    invalid = []
+    build_valid_image_indices(paths, invalid)
+    return [{"data_class": data_class, "split": split, **record} for record in invalid]
+
+
 def sample_metadata_from_valid_indices(
     valid_indices: Sequence[int], count: int, seed: int
 ) -> List[int]:

@@ -14,6 +14,11 @@ if REPO_ROOT not in sys.path:
 
 from tools.check_ddfsd_10shot_parity import compare_parity_rows, read_csv
 from util.ddfsd_main_protocol import FAKE_CLASSES, FORMAL_SEEDS, FORMAL_SHOTS
+from util.ddfsd_main_protocol_validation import (
+    load_result_configs,
+    normalize_path,
+    validate_aggregate_configs,
+)
 
 
 METRICS = ("acc", "real_acc", "fake_acc", "balanced_acc", "ap", "auc")
@@ -52,7 +57,15 @@ def _result_csv(result_dir: str, shot: int) -> str:
     return os.path.join(result_dir, filename)
 
 
-def load_formal_rows(input_root, shot_dir_template, classes, shots, seeds, ckpt_step):
+def load_formal_rows(
+    input_root,
+    shot_dir_template,
+    classes,
+    shots,
+    seeds,
+    ckpt_step,
+    configs_by_key=None,
+):
     all_rows = []
     by_class_shot = {}
     expected_seed_set = set(seeds)
@@ -72,6 +85,7 @@ def load_formal_rows(input_root, shot_dir_template, classes, shots, seeds, ckpt_
                     f"Missing formal shot result for {class_name} shot={shot}: {path}"
                 )
             rows = read_csv(path)
+            config = (configs_by_key or {}).get((class_name, shot))
             seen = set()
             for raw in rows:
                 row = dict(raw)
@@ -92,6 +106,26 @@ def load_formal_rows(input_root, shot_dir_template, classes, shots, seeds, ckpt_
                     raise ValueError(
                         f"Checkpoint step mismatch in {path}: expected {ckpt_step}, got {row['ckpt_step']}"
                     )
+                if config is not None:
+                    row_config_fields = (
+                        "checkpoint_model_mode",
+                        "model_mode",
+                        "branch_mode",
+                    )
+                    for field in row_config_fields:
+                        if row.get(field) != str(config.get(field, "")):
+                            raise ValueError(
+                                f"{field} row/config mismatch in {path} seed={seed}: "
+                                f"row={row.get(field)!r}, config={config.get(field)!r}"
+                            )
+                    for field in ("ckpt_path", "freq_stats_path"):
+                        if normalize_path(row.get(field, "")) != normalize_path(
+                            config.get(field, "")
+                        ):
+                            raise ValueError(
+                                f"{field} row/config mismatch in {path} seed={seed}: "
+                                f"row={row.get(field)!r}, config={config.get(field)!r}"
+                            )
                 for metric in METRICS:
                     value = float(row[metric])
                     if not math.isfinite(value):
@@ -145,6 +179,26 @@ def main():
         args.output_dir or os.path.join(args.input_root, "summary")
     )
 
+    config_records = load_result_configs(
+        os.path.abspath(args.input_root),
+        args.shot_dir_template,
+        classes,
+        shots,
+        args.ckpt_step,
+    )
+    config_errors = validate_aggregate_configs(
+        config_records, classes, shots, seeds, args.ckpt_step
+    )
+    if config_errors:
+        raise SystemExit(
+            "Formal configuration validation failed; no report or figures were generated:\n- "
+            + "\n- ".join(config_errors)
+        )
+    configs_by_key = {
+        (record["exclude_class"], record["shot"]): record["config"]
+        for record in config_records
+    }
+
     all_rows, by_class_shot = load_formal_rows(
         os.path.abspath(args.input_root),
         args.shot_dir_template,
@@ -152,6 +206,7 @@ def main():
         shots,
         seeds,
         args.ckpt_step,
+        configs_by_key=configs_by_key,
     )
 
     parity_rows = []

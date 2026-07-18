@@ -23,6 +23,7 @@ TAU_R=${TAU_R:-0.1}
 PYTHON_BIN=${PYTHON_BIN:-python}
 AGGREGATE=${AGGREGATE:-auto}
 SKIP_COMPLETED=${SKIP_COMPLETED:-1}
+GIT_COMMIT=${GIT_COMMIT:-"$(git rev-parse HEAD)"}
 
 CKPT_PATH_TEMPLATE=${CKPT_PATH_TEMPLATE:-"${CKPT_ROOT}/exclude_{class}/ckpt/ddfsd_step[{step}].pth"}
 FREQ_STATS_PATH_TEMPLATE=${FREQ_STATS_PATH_TEMPLATE:-"${FREQ_STATS_ROOT}/exclude_{class}/freq_stats.pt"}
@@ -46,25 +47,8 @@ render_template() {
   printf '%s\n' "${value}"
 }
 
-is_complete() {
-  local output_dir=$1
-  local shot=$2
-  if [[ "${shot}" == "0" ]]; then
-    local name
-    for name in ddfsd_zero_shot_per_seed.csv ddfsd_zero_shot_summary.csv \
-      zero_shot_metadata_manifest.csv zero_shot_invalid_images.csv zero_shot_config.json eval.log; do
-      [[ -s "${output_dir}/${name}" ]] || return 1
-    done
-  else
-    local name
-    for name in ddfsd_eval_per_seed.csv ddfsd_eval_summary.csv \
-      support_query_manifest.csv config.json eval.log; do
-      [[ -s "${output_dir}/${name}" ]] || return 1
-    done
-  fi
-}
-
 echo "protocol=main-protocol formal shot ablation"
+echo "GIT_COMMIT=${GIT_COMMIT}"
 echo "CLASSES=${CLASSES}"
 echo "SHOTS=${SHOTS}"
 echo "EVAL_SEEDS=${EVAL_SEEDS}"
@@ -105,16 +89,29 @@ for class_name in "${requested_classes[@]}"; do
 
   for shot in "${requested_shots[@]}"; do
     output_dir=$(render_template "${SHOT_OUTPUT_TEMPLATE}" "${class_name}" "${shot}")
-    if is_complete "${output_dir}" "${shot}"; then
+    if [[ -d "${output_dir}" ]]; then
+      "${PYTHON_BIN}" tools/check_ddfsd_shot_completion.py \
+        --output_dir "${output_dir}" \
+        --git_commit "${GIT_COMMIT}" \
+        --exclude_class "${class_name}" \
+        --shot "${shot}" \
+        --seeds "${EVAL_SEEDS}" \
+        --data_root "${DATA_ROOT}" \
+        --ckpt_path "${ckpt_path}" \
+        --ckpt_step "${CKPT_STEP}" \
+        --freq_stats_path "${freq_stats_path}" \
+        --checkpoint_model_mode "${MODEL_MODE}" \
+        --model_mode "${MODEL_MODE}" \
+        --branch_mode "${BRANCH_MODE}" \
+        --tau "${TAU}" \
+        --tau_r "${TAU_R}" \
+        --max_eval_query_per_class "${MAX_EVAL_QUERY_PER_CLASS}" \
+        --zero_shot_metadata_per_class "${ZERO_SHOT_METADATA_PER_CLASS}"
       if [[ "${SKIP_COMPLETED}" == "1" ]]; then
-        echo "[SKIP] exclude_${class_name}/shot_${shot} is complete"
+        echo "[SKIP] exclude_${class_name}/shot_${shot} is complete and configuration-matched"
         continue
       fi
       echo "Refusing to overwrite complete output: ${output_dir}" >&2
-      exit 1
-    fi
-    if [[ -d "${output_dir}" ]]; then
-      echo "Refusing incomplete existing output directory: ${output_dir}" >&2
       exit 1
     fi
     mkdir -p "${output_dir}"
@@ -156,6 +153,7 @@ for class_name in "${requested_classes[@]}"; do
         --eval_seeds "${EVAL_SEEDS}" \
         --eval_batch_size "${EVAL_BATCH_SIZE}" \
         --max_eval_query_per_class "${MAX_EVAL_QUERY_PER_CLASS}" \
+        --zero_shot_metadata_per_class "${ZERO_SHOT_METADATA_PER_CLASS}" \
         --tau "${TAU}" \
         --tau_r "${TAU_R}" \
         --save_manifest true \

@@ -18,11 +18,13 @@ from test_ddfsd import (
     write_csv,
 )
 from util.ddfsd_main_protocol import (
+    audit_image_paths,
     build_valid_image_indices,
     build_zero_shot_query_indices,
     sample_metadata_from_valid_indices,
     zero_shot_metadata_classes,
 )
+from util.ddfsd_main_protocol_validation import FORMAL_PROTOCOL
 from util.ddfsd_multishot_logic import resolve_checkpoint_step
 
 
@@ -99,6 +101,35 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     logger.setup(log_dir=args.output_dir, device=None)
     set_seed(args.seed)
+    real_dataset = load_ddfsd_class_dataset(
+        args.data_root, "real", "val", strict_images=True
+    )
+    fake_dataset = load_ddfsd_class_dataset(
+        args.data_root, args.exclude_class, "val", strict_images=True
+    )
+    val_invalid_rows = audit_image_paths(real_dataset.paths, "real", "val")
+    val_invalid_rows.extend(
+        audit_image_paths(fake_dataset.paths, args.exclude_class, "val")
+    )
+    val_audit_path = os.path.join(args.output_dir, "formal_val_invalid_images.csv")
+    write_csv(
+        val_audit_path,
+        val_invalid_rows,
+        [
+            "data_class",
+            "split",
+            "dataset_index",
+            "filepath",
+            "error_type",
+            "error",
+        ],
+    )
+    if val_invalid_rows:
+        raise RuntimeError(
+            f"Formal evaluation found {len(val_invalid_rows)} invalid val images; "
+            f"audit saved to {val_audit_path}. No evaluation was run."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = load_checkpoint(args.ckpt_path)
     ckpt_step = resolve_checkpoint_step(
@@ -130,8 +161,6 @@ def main():
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
 
-    real_dataset = load_ddfsd_class_dataset(args.data_root, "real", "val")
-    fake_dataset = load_ddfsd_class_dataset(args.data_root, args.exclude_class, "val")
     real_query, fake_query = build_zero_shot_query_indices(
         len(real_dataset), len(fake_dataset)
     )
@@ -170,7 +199,9 @@ def main():
         "error",
     ]
     for name in metadata_names:
-        dataset = load_ddfsd_class_dataset(args.data_root, name, "train")
+        dataset = load_ddfsd_class_dataset(
+            args.data_root, name, "train", strict_images=True
+        )
         class_invalid = []
         valid_indices = build_valid_image_indices(dataset.paths, class_invalid)
         for record in class_invalid:
@@ -392,7 +423,7 @@ def main():
     )
 
     config = {
-        "protocol": "main-protocol formal shot ablation",
+        "protocol": FORMAL_PROTOCOL,
         "git_commit": git_commit(),
         "command": sys.argv,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -415,6 +446,8 @@ def main():
         "max_eval_query_per_class": 0,
         "num_real_query": len(real_query),
         "num_fake_query": len(fake_query),
+        "strict_formal_eval_images": True,
+        "formal_val_invalid_images_path": os.path.abspath(val_audit_path),
     }
     with open(
         os.path.join(args.output_dir, "zero_shot_config.json"), "w", encoding="utf-8"

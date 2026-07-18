@@ -151,15 +151,54 @@ def compare_parity_rows(
     return differences, errors
 
 
+def validate_reference_rows(
+    rows: Sequence[dict],
+    expected_seeds: Sequence[int] = DEFAULT_SEEDS,
+    expected_ckpt_step: int = 15000,
+    expected_exclude_class: str = "",
+) -> List[str]:
+    indexed, errors = _index_rows(rows, "reference CSV")
+    expected = set(map(int, expected_seeds))
+    missing = sorted(expected - set(indexed))
+    unexpected = sorted(set(indexed) - expected)
+    if missing:
+        errors.append(f"reference CSV is missing seeds: {missing}")
+    if unexpected:
+        errors.append(f"reference CSV has unexpected seeds: {unexpected}")
+    for seed, row in sorted(indexed.items()):
+        if (
+            expected_exclude_class
+            and row.get("exclude_class") != expected_exclude_class
+        ):
+            errors.append(
+                f"reference CSV seed {seed} has exclude_class={row.get('exclude_class')!r}, "
+                f"expected {expected_exclude_class!r}"
+            )
+        try:
+            step = int(row["ckpt_step"])
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"reference CSV seed {seed} has invalid ckpt_step: {exc}")
+            continue
+        if step != expected_ckpt_step:
+            errors.append(
+                f"reference CSV seed {seed} has ckpt_step={step}, "
+                f"expected {expected_ckpt_step}"
+            )
+    return errors
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Check DDFSD main-protocol 10-shot parity"
     )
-    parser.add_argument("--new_csv", required=True)
+    parser.add_argument("--new_csv", default="")
     parser.add_argument("--reference_csv", required=True)
-    parser.add_argument("--output_csv", required=True)
+    parser.add_argument("--output_csv", default="")
     parser.add_argument("--expected_seeds", default=",".join(map(str, DEFAULT_SEEDS)))
     parser.add_argument("--tolerance", type=float, default=1e-6)
+    parser.add_argument("--expected_ckpt_step", type=int, default=15000)
+    parser.add_argument("--validate_reference_only", action="store_true")
+    parser.add_argument("--expected_exclude_class", default="")
     return parser.parse_args()
 
 
@@ -168,8 +207,30 @@ def main():
     seeds = [
         int(value.strip()) for value in args.expected_seeds.split(",") if value.strip()
     ]
+    if not os.path.isfile(args.reference_csv):
+        raise SystemExit(f"Reference CSV does not exist: {args.reference_csv}")
+    reference_rows = read_csv(args.reference_csv)
+    reference_errors = validate_reference_rows(
+        reference_rows,
+        seeds,
+        args.expected_ckpt_step,
+        args.expected_exclude_class,
+    )
+    if reference_errors:
+        raise SystemExit(
+            "Reference 10-shot CSV validation FAILED:\n- "
+            + "\n- ".join(reference_errors)
+        )
+    if args.validate_reference_only:
+        print(f"Reference 10-shot CSV validation PASS: {args.reference_csv}")
+        return
+    if not args.new_csv or not args.output_csv:
+        raise SystemExit(
+            "--new_csv and --output_csv are required unless "
+            "--validate_reference_only is used."
+        )
     differences, errors = compare_parity_rows(
-        read_csv(args.new_csv), read_csv(args.reference_csv), seeds, args.tolerance
+        read_csv(args.new_csv), reference_rows, seeds, args.tolerance
     )
     write_csv(args.output_csv, differences)
     if errors:

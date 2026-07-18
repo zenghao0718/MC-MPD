@@ -1,7 +1,10 @@
 import copy
 import unittest
 
-from tools.check_ddfsd_10shot_parity import compare_parity_rows
+from tools.check_ddfsd_10shot_parity import (
+    compare_parity_rows,
+    validate_reference_rows,
+)
 
 
 def row(seed, **updates):
@@ -69,6 +72,33 @@ class TenShotParityTest(unittest.TestCase):
         self.assertTrue(any("auc difference" in error for error in errors))
         self.assertEqual(self.new, expected_after_change)
         self.assertNotEqual(self.new, before)
+
+    def test_reference_precheck_validates_seed_shot_and_step(self):
+        self.assertEqual(validate_reference_rows(self.reference, [42, 101], 15000), [])
+        wrong_step = copy.deepcopy(self.reference)
+        wrong_step[0]["ckpt_step"] = "14000"
+        self.assertTrue(
+            any(
+                "ckpt_step=14000" in error
+                for error in validate_reference_rows(wrong_step, [42, 101], 15000)
+            )
+        )
+        wrong_shot = copy.deepcopy(self.reference)
+        wrong_shot[0]["support_shot"] = "5"
+        self.assertTrue(
+            any(
+                "non-10-shot" in error
+                for error in validate_reference_rows(wrong_shot, [42, 101], 15000)
+            )
+        )
+        self.assertTrue(
+            any(
+                "expected 'BigGAN'" in error
+                for error in validate_reference_rows(
+                    self.reference, [42, 101], 15000, "BigGAN"
+                )
+            )
+        )
 
 
 if __name__ == "__main__":

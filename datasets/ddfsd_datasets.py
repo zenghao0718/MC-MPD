@@ -91,6 +91,22 @@ class ImagePathDataset(Dataset):
         return image, 0
 
 
+class FormalEvalImagePathDataset(ImagePathDataset):
+    """Strict dataset whose index always resolves to its exact manifest path."""
+
+    def _load_image(self, index: int):
+        path = self.paths[index]
+        try:
+            with Image.open(path) as image:
+                decoded = image.convert("RGB")
+                decoded.load()
+                return decoded
+        except Exception as exc:  # noqa: BLE001 - retain exact decode failure context
+            raise RuntimeError(
+                f"Formal evaluation cannot decode exact dataset path: {path} ({exc})"
+            ) from exc
+
+
 def make_train_transform():
     return transforms.Compose(
         [
@@ -148,13 +164,17 @@ def load_ddfsd_class_dataset(
     class_name: str,
     split: str,
     transform=None,
+    strict_images: bool = False,
 ) -> ImagePathDataset:
     validate_generator_name(class_name, allow_real=True)
     if split not in {"train", "val"}:
         raise ValueError(f"DDFSD uses only train/val splits, got: {split}")
     if transform is None:
         transform = make_eval_transform()
-    return ImagePathDataset(os.path.join(data_root, class_name, split), transform=transform)
+    dataset_class = FormalEvalImagePathDataset if strict_images else ImagePathDataset
+    return dataset_class(
+        os.path.join(data_root, class_name, split), transform=transform
+    )
 
 
 def make_subset_loader(

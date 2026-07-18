@@ -80,6 +80,7 @@ def evaluate_binary_few_shot(
     model_mode: str = "dual",
     branch_mode: str = None,
     return_indices: bool = False,
+    strict_images: bool = False,
 ) -> Dict[str, Any]:
     """Evaluate real-vs-fake with fixed support and remaining val images as query."""
 
@@ -92,8 +93,12 @@ def evaluate_binary_few_shot(
         raise ValueError(f"A {model_mode} checkpoint can only be evaluated with branch_mode={model_mode}.")
 
     model.eval()
-    real_dataset = load_ddfsd_class_dataset(data_root, "real", "val")
-    fake_dataset = load_ddfsd_class_dataset(data_root, fake_class, "val")
+    real_dataset = load_ddfsd_class_dataset(
+        data_root, "real", "val", strict_images=strict_images
+    )
+    fake_dataset = load_ddfsd_class_dataset(
+        data_root, fake_class, "val", strict_images=strict_images
+    )
     max_query = max_query_per_class if max_query_per_class > 0 else None
 
     real_support_idx, real_query_idx = sample_support_query_indices(

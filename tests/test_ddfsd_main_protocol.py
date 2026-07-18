@@ -5,6 +5,7 @@ import unittest
 
 from test_ddfsd import sampling_manifest_rows
 from util.ddfsd_main_protocol import (
+    audit_image_paths,
     build_valid_image_indices,
     build_zero_shot_query_indices,
     sample_metadata_from_valid_indices,
@@ -23,6 +24,15 @@ try:
 except (ImportError, RuntimeError):
     binary_metrics = None
     evaluate_binary_few_shot = None
+
+try:
+    from datasets.ddfsd_datasets import (
+        FormalEvalImagePathDataset,
+        ImagePathDataset,
+    )
+except (ImportError, RuntimeError):
+    FormalEvalImagePathDataset = None
+    ImagePathDataset = None
 
 
 class MainProtocolSamplingTest(unittest.TestCase):
@@ -145,6 +155,60 @@ class MetadataValidityTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "only 4 valid images"):
                 sample_metadata_from_valid_indices(valid, 5, seed=42)
+
+
+@unittest.skipUnless(
+    Image is not None and FormalEvalImagePathDataset is not None,
+    "Pillow/DDFSD dataset dependencies are unavailable",
+)
+class StrictFormalImageDatasetTest(unittest.TestCase):
+    def test_formal_eval_never_replaces_corrupt_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corrupt = os.path.join(directory, "00_corrupt.png")
+            valid = os.path.join(directory, "01_valid.png")
+            with open(corrupt, "wb") as handle:
+                handle.write(b"broken")
+            Image.new("RGB", (4, 4), color=(10, 20, 30)).save(valid)
+
+            training_dataset = ImagePathDataset(directory, transform=None)
+            strict_dataset = FormalEvalImagePathDataset(directory, transform=None)
+            # Existing training behavior remains tolerant and advances to the valid image.
+            training_image, _ = training_dataset[0]
+            self.assertEqual(training_image.getpixel((0, 0)), (10, 20, 30))
+            # Formal evaluation keeps index/path identity and fails at the corrupt path.
+            self.assertEqual(strict_dataset.paths[0], corrupt)
+            with self.assertRaisesRegex(RuntimeError, "00_corrupt.png"):
+                strict_dataset[0]
+            strict_image, _ = strict_dataset[1]
+            self.assertEqual(strict_dataset.paths[1], valid)
+            self.assertEqual(strict_image.getpixel((0, 0)), (10, 20, 30))
+            audit = audit_image_paths(strict_dataset.paths, "real", "val")
+            self.assertEqual([row["filepath"] for row in audit], [corrupt])
+
+    def test_manifest_path_matches_strict_dataset_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for index in range(3):
+                Image.new("RGB", (4, 4), color=(index, 0, 0)).save(
+                    os.path.join(directory, f"{index}.png")
+                )
+            dataset = FormalEvalImagePathDataset(directory, transform=None)
+            sampling = {
+                "real": {
+                    "support_indices": [2],
+                    "query_indices": [0, 1],
+                    "paths": dataset.paths,
+                },
+                "ADM": {
+                    "support_indices": [1],
+                    "query_indices": [0, 2],
+                    "paths": dataset.paths,
+                },
+            }
+            rows = sampling_manifest_rows("ADM", 42, 1, sampling)
+            for row in rows:
+                self.assertEqual(
+                    row["filepath"], dataset.paths[int(row["dataset_index"])]
+                )
 
 
 class ZeroShotProtocolTest(unittest.TestCase):

@@ -10,6 +10,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+from util.ddfsd_main_protocol import audit_image_paths
+from util.ddfsd_main_protocol_validation import FORMAL_PROTOCOL
 from util.ddfsd_multishot_logic import resolve_checkpoint_step
 
 
@@ -55,6 +57,7 @@ def parse_args():
     parser.add_argument("--eval_seeds", type=str, default="42,101,102,103,104")
     parser.add_argument("--eval_batch_size", type=int, default=128)
     parser.add_argument("--max_eval_query_per_class", type=int, default=0)
+    parser.add_argument("--zero_shot_metadata_per_class", type=int, default=1024)
     parser.add_argument(
         "--save_manifest",
         type=str2bool,
@@ -75,12 +78,16 @@ def parse_args():
 
 def load_runtime_dependencies():
     global torch, logger, validate_generator_name, DDFSDDualDomainNet
+    global load_ddfsd_class_dataset
     global evaluate_binary_few_shot, load_frequency_stats, set_seed
 
     import torch
 
     import util.logger as logger
-    from datasets.ddfsd_datasets import validate_generator_name
+    from datasets.ddfsd_datasets import (
+        load_ddfsd_class_dataset,
+        validate_generator_name,
+    )
     from model.ddfsd import DDFSDDualDomainNet
     from util.ddfsd_eval import evaluate_binary_few_shot
     from util.ddfsd_frequency import load_frequency_stats
@@ -181,6 +188,34 @@ def sampling_manifest_rows(exclude_class, seed, shot, sampling):
     return rows
 
 
+def audit_formal_val_images(data_root, exclude_class, output_dir):
+    rows = []
+    for data_class in ("real", exclude_class):
+        dataset = load_ddfsd_class_dataset(
+            data_root, data_class, "val", strict_images=True
+        )
+        rows.extend(audit_image_paths(dataset.paths, data_class, "val"))
+    path = os.path.join(output_dir, "formal_val_invalid_images.csv")
+    write_csv(
+        path,
+        rows,
+        [
+            "data_class",
+            "split",
+            "dataset_index",
+            "filepath",
+            "error_type",
+            "error",
+        ],
+    )
+    if rows:
+        raise RuntimeError(
+            f"Formal evaluation found {len(rows)} invalid val images; "
+            f"audit saved to {path}. No evaluation was run."
+        )
+    return path
+
+
 def main():
     args = parse_args()
     load_runtime_dependencies()
@@ -189,6 +224,9 @@ def main():
         set_seed(args.seed)
 
     logger.setup(log_dir=args.output_dir, device=None)
+    val_audit_path = audit_formal_val_images(
+        args.data_root, args.exclude_class, args.output_dir
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = load_checkpoint(args.ckpt_path)
     model_mode = resolve_model_mode(args.model_mode, checkpoint)
@@ -238,6 +276,8 @@ def main():
         raise ValueError("test_ddfsd.py main-protocol evaluation requires num_support_test > 0.")
     if args.max_eval_query_per_class < 0:
         raise ValueError("max_eval_query_per_class must be non-negative.")
+    if args.zero_shot_metadata_per_class <= 0:
+        raise ValueError("zero_shot_metadata_per_class must be positive.")
 
     per_seed_rows = []
     manifest_rows = []
@@ -258,6 +298,7 @@ def main():
             model_mode=model_mode,
             branch_mode=branch_mode,
             return_indices=args.save_manifest,
+            strict_images=True,
         )
         row = {
             "checkpoint_model_mode": model_mode,
@@ -440,7 +481,7 @@ def main():
         logger.info("Saved support/query manifest: %s", manifest_path)
 
     config = {
-        "protocol": "main-protocol formal shot ablation",
+        "protocol": FORMAL_PROTOCOL,
         "git_commit": git_commit(),
         "command": sys.argv,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -459,12 +500,15 @@ def main():
         "tau": args.tau,
         "tau_r": args.tau_r,
         "max_eval_query_per_class": args.max_eval_query_per_class,
+        "zero_shot_metadata_per_class": args.zero_shot_metadata_per_class,
         "save_manifest": args.save_manifest,
         "manifest_path": (
             os.path.abspath(args.manifest_path or os.path.join(args.output_dir, "support_query_manifest.csv"))
             if args.save_manifest
             else ""
         ),
+        "strict_formal_eval_images": True,
+        "formal_val_invalid_images_path": os.path.abspath(val_audit_path),
     }
     with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2, ensure_ascii=False)
