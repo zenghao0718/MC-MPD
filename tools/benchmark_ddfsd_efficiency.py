@@ -63,7 +63,10 @@ def configure_logging(output_dir: Path) -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    for handler in (logging.StreamHandler(), logging.FileHandler(output_dir / "benchmark.log", encoding="utf-8")):
+    for handler in (
+        logging.StreamHandler(),
+        logging.FileHandler(output_dir / "benchmark.log", mode="w", encoding="utf-8"),
+    ):
         handler.setFormatter(formatter)
         logger.addHandler(handler)
     return logger
@@ -89,6 +92,21 @@ def validate_args(args: argparse.Namespace) -> Tuple[Path, Path, Path, torch.dev
         raise ValueError("Formal throughput requires a CUDA device; CPU results are not accepted.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Formal DDFSD throughput must run on an AutoDL CUDA GPU.")
+    gpu_index = device.index if device.index is not None else torch.cuda.current_device()
+    device_count = torch.cuda.device_count()
+    if gpu_index < 0 or gpu_index >= device_count:
+        raise ValueError(
+            f"Invalid CUDA device index {gpu_index}; this host exposes {device_count} CUDA device(s)."
+        )
+    torch.cuda.set_device(gpu_index)
+    device = torch.device("cuda", gpu_index)
+    if output_dir.exists() and not output_dir.is_dir():
+        raise NotADirectoryError(f"Output path is not a directory: {output_dir}")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(
+            f"Output directory is not empty: {output_dir}. "
+            "Use a new output directory for each benchmark run."
+        )
     return ckpt_path, stats_path, output_dir, device
 
 
@@ -150,6 +168,13 @@ def prepare_support_cache(model, input_size: int, seed: int, device: torch.devic
     proto_rgb, proto_freq = compute_prototypes(support_rgb, support_freq, model_mode=MODEL_MODE)
     sigma_rgb, sigma_freq = compute_support_sigmas(support_rgb, support_freq, proto_rgb, proto_freq)
     alpha = compute_alpha(sigma_rgb, sigma_freq, tau_r=tau_r)
+    expected_proto = (1, 2, embedding_dim)
+    if tuple(proto_rgb.shape) != expected_proto or tuple(proto_freq.shape) != expected_proto:
+        raise RuntimeError(
+            f"Unexpected prototype layout: {proto_rgb.shape}, {proto_freq.shape}; expected {expected_proto}."
+        )
+    if tuple(alpha.shape) != (1, 2):
+        raise RuntimeError(f"Unexpected alpha layout: {alpha.shape}; expected (1, 2).")
     for name, value in (("proto_rgb", proto_rgb), ("proto_freq", proto_freq), ("alpha", alpha)):
         require_finite(name, value)
     return proto_rgb, proto_freq, alpha
@@ -158,12 +183,43 @@ def prepare_support_cache(model, input_size: int, seed: int, device: torch.devic
 def run_query_inference(model, query_images, proto_rgb, proto_freq, alpha, tau, precision):
     with autocast_context(precision):
         outputs = model(query_images)
+        query_rgb = outputs.get("z_rgb")
+        query_freq = outputs.get("z_freq")
+        if query_rgb is None or query_freq is None:
+            raise RuntimeError("Dual model forward must return both z_rgb and z_freq.")
+        expected_prefix = (query_images.shape[0],)
+        if query_rgb.ndim != 2 or query_freq.ndim != 2 or query_rgb.shape[:1] != expected_prefix or query_freq.shape[:1] != expected_prefix:
+            raise RuntimeError(
+                f"Unexpected query embedding shapes: z_rgb={tuple(query_rgb.shape)}, "
+                f"z_freq={tuple(query_freq.shape)}."
+            )
         query_out = compute_query_logits(
-            query_rgb=outputs.get("z_rgb"), query_freq=outputs.get("z_freq"),
+            query_rgb=query_rgb.unsqueeze(0), query_freq=query_freq.unsqueeze(0),
             proto_rgb=proto_rgb, proto_freq=proto_freq, alpha=alpha,
             tau=tau, branch_mode=MODEL_MODE, model_mode=MODEL_MODE,
         )
     return query_out["logits"]
+
+
+def validate_core_modules_called(model, uncalled_modules) -> Dict[str, bool]:
+    """Reject a core branch only when it and every descendant are uncalled."""
+
+    uncalled = set(uncalled_modules)
+    module_names = {name for name, _ in model.named_modules()}
+    result = {}
+    for core_name in ("rgb_backbone", "rgb_projector", "freq_backbone", "freq_projector"):
+        branch_names = sorted(
+            name for name in module_names if name == core_name or name.startswith(f"{core_name}.")
+        )
+        if not branch_names:
+            raise RuntimeError(f"Required DDFSD core module is missing: {core_name}.")
+        result[core_name] = any(name not in uncalled for name in branch_names)
+    missing = [name for name, called in result.items() if not called]
+    if missing:
+        raise RuntimeError(
+            "fvcore did not call any module in these DDFSD core branches: " + ", ".join(missing)
+        )
+    return result
 
 
 def model_complexity(model, input_size: int, device: torch.device) -> Dict[str, Any]:
@@ -188,6 +244,7 @@ def model_complexity(model, input_size: int, device: torch.device) -> Dict[str, 
         flops = int(analysis.total())
         unsupported = dict(sorted((str(key), int(value)) for key, value in analysis.unsupported_ops().items()))
         uncalled = sorted(str(item) for item in analysis.uncalled_modules())
+        core_module_call_check = validate_core_modules_called(model, uncalled)
     if flops <= 0:
         raise RuntimeError(f"fvcore returned an invalid FLOP count: {flops}.")
     return {
@@ -196,20 +253,33 @@ def model_complexity(model, input_size: int, device: torch.device) -> Dict[str, 
         "model_size_bytes": model_size_bytes, "model_size_mb": model_size_bytes / (1024 ** 2),
         "flops": flops, "flops_g": flops / 1e9, "flops_tool": "fvcore.nn.FlopCountAnalysis",
         "unsupported_ops": unsupported, "uncalled_modules": uncalled,
+        "core_module_call_check": core_module_call_check,
     }
 
 
 def benchmark_throughput(model, query_images, cache, tau, args):
     proto_rgb, proto_freq, alpha = cache
     expected_shape = (1, args.batch_size, 2)
-    with torch.inference_mode():
+    expected_device = query_images.device
+    model_device = next(model.parameters()).device
+    devices = {
+        "model": model_device, "query_images": query_images.device, "proto_rgb": proto_rgb.device,
+        "proto_freq": proto_freq.device, "alpha": alpha.device,
+    }
+    mismatched = {name: str(value) for name, value in devices.items() if value != expected_device}
+    if mismatched:
+        raise RuntimeError(f"Benchmark tensors/model are not all on {expected_device}: {mismatched}.")
+    expected_query_shape = (args.batch_size, 3, args.input_size, args.input_size)
+    if tuple(query_images.shape) != expected_query_shape:
+        raise RuntimeError(f"Query tensor shape is {tuple(query_images.shape)}, expected {expected_query_shape}.")
+    with torch.cuda.device(expected_device), torch.inference_mode():
         logits = run_query_inference(model, query_images, proto_rgb, proto_freq, alpha, tau, args.precision)
         if tuple(logits.shape) != expected_shape:
             raise RuntimeError(f"Query logits shape is {tuple(logits.shape)}, expected {expected_shape}.")
         require_finite("query logits", logits)
         for _ in range(args.warmup_iters):
             run_query_inference(model, query_images, proto_rgb, proto_freq, alpha, tau, args.precision)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(expected_device)
         rows = []
         for repeat in range(1, args.repeats + 1):
             start = torch.cuda.Event(enable_timing=True)
@@ -218,9 +288,13 @@ def benchmark_throughput(model, query_images, cache, tau, args):
             for _ in range(args.measure_iters):
                 run_query_inference(model, query_images, proto_rgb, proto_freq, alpha, tau, args.precision)
             end.record()
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(expected_device)
             elapsed_ms = float(start.elapsed_time(end))
             total_images = args.batch_size * args.measure_iters
+            if not math.isfinite(elapsed_ms) or elapsed_ms <= 0 or total_images <= 0:
+                raise RuntimeError(
+                    f"Invalid timing in repeat {repeat}: elapsed_ms={elapsed_ms}, total_images={total_images}."
+                )
             images_per_second = total_images / (elapsed_ms / 1000.0)
             if not math.isfinite(images_per_second) or images_per_second <= 0:
                 raise RuntimeError(f"Invalid throughput in repeat {repeat}: {images_per_second}.")
@@ -326,6 +400,8 @@ DDFSD Dual（`model_mode=dual`），checkpoint：`{environment['checkpoint_path'
 
 Basic tensor operations used by Haar-DWT may not be fully counted by the profiling tool.
 
+Core module call check: `{json.dumps(complexity['core_module_call_check'], ensure_ascii=False)}`.
+
 ## 计时边界与声明
 
 计时范围包含：已驻留 GPU 的 Query Tensor经过完整双分支 `model.forward`，与缓存 RGB/Frequency prototypes 计算距离，使用缓存 adaptive alpha 融合并输出二分类 logits。计时不包含 checkpoint/模型加载、Support 编码与初始化、prototype/alpha 一次性构建、磁盘读取、图像解码、DataLoader、CPU→GPU 传输、指标计算及文件写入。
@@ -337,10 +413,13 @@ Support、prototype 和 adaptive alpha 在所有 warmup、measurement 与 repeat
 
 def main() -> int:
     args = parse_args()
-    output_hint = Path(args.output_dir).expanduser().resolve()
-    logger = configure_logging(output_hint)
     try:
         ckpt_path, stats_path, output_dir, device = validate_args(args)
+    except Exception as exc:
+        print(f"DDFSD efficiency benchmark validation failed: {exc}", file=sys.stderr)
+        return 1
+    logger = configure_logging(output_dir)
+    try:
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = True
@@ -368,6 +447,10 @@ def main() -> int:
             "gpu_name": environment["gpu_name"], "checkpoint_step": environment["checkpoint_step"],
             "checkpoint_path": str(ckpt_path), "freq_stats_path": str(stats_path),
             "git_commit": environment["git_commit"],
+            "core_modules_called": ";".join(
+                f"{name}={str(called).lower()}"
+                for name, called in complexity["core_module_call_check"].items()
+            ),
         }
         write_json(output_dir / "environment.json", environment)
         write_json(output_dir / "run_config.json", run_config)
@@ -380,6 +463,7 @@ def main() -> int:
             "throughput_mean", "throughput_std", "throughput_min", "throughput_max",
             "support_shot", "alpha_mean", "alpha_min", "alpha_max", "gpu_name",
             "checkpoint_step", "checkpoint_path", "freq_stats_path", "git_commit",
+            "core_modules_called",
         ]
         summary_row = {field: summary.get(field) for field in summary_fields}
         write_csv(output_dir / "efficiency_summary.csv", [summary_row], summary_fields)

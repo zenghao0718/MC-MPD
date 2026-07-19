@@ -3,7 +3,8 @@ set -euo pipefail
 
 CKPT_PATH=${CKPT_PATH:-""}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-""}
-OUTPUT_DIR=${OUTPUT_DIR:-"./efficiency_experiments/ddfsd_dual_fp32_bs32"}
+TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
+OUTPUT_DIR=${OUTPUT_DIR:-"./efficiency_experiments/ddfsd_dual_fp32_bs32_${TIMESTAMP}"}
 
 BATCH_SIZE=${BATCH_SIZE:-32}
 INPUT_SIZE=${INPUT_SIZE:-224}
