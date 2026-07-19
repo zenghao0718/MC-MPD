@@ -1,85 +1,135 @@
-# Few-Shot AI-Generated Image Detector
+# Dual-Domain Few-Shot AIGI Detector
 
-Official Pytorch implementation of paper:
+This repository contains the final full-data, 15,000-step main-experiment pipeline for Dual-Domain Few-Shot AIGI Detection (DDFSD). The method combines spatial RGB evidence and frequency-domain artifacts in a prototype-based detector for leave-one-generator-out evaluation on GenImage.
 
-> [Few-Shot Learner Generalizes Across AI-Generated Image Detection](https://arxiv.org/abs/2501.08763)
->
-> Shiyu Wu, Jing Liu, Jing Li, Yequan Wang
+## Method
 
-Novel AI-generated image detector which is able to effectively distinguish unseen fake images by utilizing very few new samples. 
+DDFSD uses an ImageNet-pretrained ResNet-50 RGB encoder and a ResNet-18 frequency encoder. The frequency input consists of the signed LH, HL, and HH bands from a Haar DWT of the image Y channel. Both encoders project to normalized embeddings, from which episode prototypes are built. Adaptive alpha weights fuse RGB and frequency distances according to support-set dispersion, while a prototype separation loss encourages real/fake and fake/fake margins. Main training uses branch dropout but always evaluates the full dual-branch model.
 
-## Requirements
+## Installation
 
-You can setup the environment as follows:
-
-```python
-# create conda environment
-conda create -n FSD -y python=3.12
-conda activate FSD
-
-# install dependencies
+```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Getting Data & Directory structure
+Training and evaluation require a CUDA-capable PyTorch environment. The scripts use a single process and one GPU.
 
-To download [GenImage](https://arxiv.org/abs/2306.08571) dataset, please refer to [this repository](https://github.com/GenImage-Dataset/GenImage) or download from [Baidu Yunpan](https://pan.baidu.com/share/init?surl=i0OFqYN5i6oFAxeK6bIwRQ) with code ztf1. 
+## Data layout
 
-<details>
-<summary> Please organize the above data as follows: </summary>
+`DATA_ROOT` must point directly to the directory containing these seven class directories:
 
-```
-data/
-|-- GenImage/
-|   |-- ADM
-|   |   |--train/ai/
-|   |   |   |--0_adm_0.PNG
-|   |   |   |......
-|   |   |--val/ai/
-|   |   |   |--0_adm_7.PNG
-|   |   |   |......
-|   |-- BigGAN
-|   |-- glide
-|   |-- Midjourney
-|   |-- SD
-|   |-- VQDM
-|   |-- real
-|   |   |--train/nature/
-|   |   |   |......
-```
-
-Real data are those nature images from stable_diffusion_v_1_4 and stable_diffusion_v_1_5. 
-</details>
-
-
-## Training
-
-```
-bash scripts/train.sh
+```text
+GenImage/
+├── real/
+│   ├── train/
+│   └── val/
+├── ADM/
+│   ├── train/
+│   └── val/
+├── BigGAN/
+│   ├── train/
+│   └── val/
+├── glide/
+│   ├── train/
+│   └── val/
+├── Midjourney/
+│   ├── train/
+│   └── val/
+├── SD/
+│   ├── train/
+│   └── val/
+└── VQDM/
+    ├── train/
+    └── val/
 ```
 
-This script enables training with 4 GPUs, you can specify the number of GPUs by setting `GPU_NUM`.
+The repository intentionally does not include dataset construction or extraction utilities.
 
-## Inference
+## Main experiment
 
+Train one leave-one-out task:
+
+```bash
+DATA_ROOT=/root/autodl-tmp/data_fsd_full/GenImage \
+EXCLUDE_CLASS=ADM \
+bash scripts/train_main.sh
 ```
-bash scripts/eval.sh
+
+Evaluate its step-15000 checkpoint:
+
+```bash
+DATA_ROOT=/root/autodl-tmp/data_fsd_full/GenImage \
+EXCLUDE_CLASS=ADM \
+bash scripts/eval_main.sh
 ```
 
-Please specify the checkpoint directroy in the script. 
+Run all six tasks in order (`ADM BigGAN glide Midjourney SD VQDM`):
 
-## Checkpoints
-We provide our checkpoints trained on each test part for our cross-generator evaluation at [Baidu Yunpan](https://pan.baidu.com/s/1zNxDKtFJ_5KXcMceNtrRqA?pwd=icml) with code icml. 
-
-## Citing
-If you find this repository useful for your work, please consider citing it as follows:
+```bash
+MODE=all bash scripts/run_main_experiment.sh
 ```
-@article{wu2025fsd,
-  title={Few-Shot Learner Generalizes Across AI-Generated Image Detection},
-  author={Shiyu Wu and Jing Liu and Jing Li and Yequan Wang},
-  eprint={2501.08763},
-  year={2025},
-  journal={arXiv preprint arXiv:2501.08763},
-  url={https://arxiv.org/abs/2501.08763}
+
+Use `MODE=train` or `MODE=eval` to run only that phase. A class failure stops the overall driver and reports its exit code.
+
+### Fixed configuration
+
+| Item | Main setting |
+| --- | --- |
+| Data | Full GenImage |
+| Protocol | Six-class leave-one-out |
+| Training | Single GPU, 15,000 steps, batch size 16 |
+| Episode | 3-way (real + 2 fake), 5 support and 5 query per class |
+| Scheduler | StepLR, step size 5,000, gamma 0.5 |
+| Learning rates | RGB/frequency backbones `3e-5`; heads `1e-4` |
+| Margins | `m_rf=1.2`, `m_ff=0.6` |
+| Separation | `lambda_ff=0.5`, target `0.03`, warmup 2,500–7,500 |
+| Branch dropout | dual 0.90, RGB-only 0.05, frequency-only 0.05 |
+| Evaluation | step 15,000; 10-shot; seeds 42, 101, 102, 103, 104 |
+| Inference | dual branch, adaptive alpha, complete validation query set |
+| Metrics | Accuracy, AP, AUC |
+
+## Checkpoints and outputs
+
+The default run root is:
+
+```text
+/root/autodl-tmp/runs/Dual-Domain-Few-Shot-AIGI-Detector/main_full_steps15000/
+└── exclude_<class>/
+    ├── ckpt/
+    ├── tb/
+    ├── logs/
+    ├── train.log
+    ├── freq_stats.pt
+    └── formal_eval_step15000/
+        ├── ddfsd_eval_per_seed.csv
+        ├── ddfsd_eval_summary.csv
+        ├── config.json
+        └── eval.log
+```
+
+`eval_main.sh` loads `ckpt/ddfsd_step[15000].pth` and the matching `freq_stats.pt`. It refuses to recompute frequency statistics during evaluation. Override `RUN_ROOT`, `RUN_DIR`, `CKPT_PATH`, or `FREQ_STATS_PATH` when files are stored elsewhere. Training refuses to reuse an output directory that already contains checkpoints.
+
+Pretrained checkpoint download: [Baidu Netdisk](https://pan.baidu.com/s/1fXonbCSiWqMYksSyCAoN0A?pwd=vwq6).
+
+TensorBoard events are written below each class run's `tb/` directory. For example:
+
+```bash
+tensorboard --logdir /root/autodl-tmp/runs/Dual-Domain-Few-Shot-AIGI-Detector/main_full_steps15000 --host 0.0.0.0 --port 6006
+```
+
+## Citation
+
+```bibtex
+@article{ddfsd,
+  title   = {Dual-Domain Few-Shot AIGI Detector},
+  author  = {Anonymous},
+  journal = {To appear},
+  year    = {2026}
 }
 ```
+
+## Acknowledgements
+
+We thank the authors of the FSD paper and project, on which this work builds.

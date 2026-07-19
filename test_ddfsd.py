@@ -10,9 +10,9 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from util.ddfsd_main_protocol import audit_image_paths
-from util.ddfsd_main_protocol_validation import FORMAL_PROTOCOL
-from util.ddfsd_multishot_logic import resolve_checkpoint_step
+from PIL import Image
+
+FORMAL_PROTOCOL = "main_full_steps15000_10shot_5seed"
 
 
 def str2bool(value):
@@ -42,13 +42,13 @@ def parse_args():
     parser.add_argument("--exclude_class", type=str, default="ADM")
     parser.add_argument("--ckpt_path", type=str, required=True)
     parser.add_argument("--ckpt_step", type=int, default=0)
-    parser.add_argument("--model_mode", type=str, default="auto", choices=["auto", "dual", "rgb-only", "freq-only"])
+    parser.add_argument("--model_mode", type=str, default="dual", choices=["dual"])
     parser.add_argument(
         "--branch_mode",
         type=str,
-        default=None,
-        choices=["dual", "rgb-only", "freq-only"],
-        help="Inference branch; defaults to the checkpoint model mode for backward compatibility.",
+        default="dual",
+        choices=["dual"],
+        help="The published main evaluation always uses both branches.",
     )
     parser.add_argument("--freq_stats_path", type=str, default="")
     parser.add_argument("--num_support_test", type=int, default=10)
@@ -57,19 +57,6 @@ def parse_args():
     parser.add_argument("--eval_seeds", type=str, default="42,101,102,103,104")
     parser.add_argument("--eval_batch_size", type=int, default=128)
     parser.add_argument("--max_eval_query_per_class", type=int, default=0)
-    parser.add_argument("--zero_shot_metadata_per_class", type=int, default=1024)
-    parser.add_argument(
-        "--save_manifest",
-        type=str2bool,
-        default=False,
-        help="Save the exact support/query indices used by this main-protocol evaluation.",
-    )
-    parser.add_argument(
-        "--manifest_path",
-        type=str,
-        default="",
-        help="Manifest destination; defaults to OUTPUT_DIR/support_query_manifest.csv.",
-    )
 
     parser.add_argument("--tau", type=float, default=0.2)
     parser.add_argument("--tau_r", type=float, default=0.1)
@@ -144,6 +131,43 @@ def write_csv(path: str, rows, fieldnames):
         writer.writerows(rows)
 
 
+def resolve_checkpoint_step(requested_step: int, checkpoint_step: int, checkpoint_path: str) -> int:
+    """Validate the requested step against checkpoint metadata."""
+
+    requested_step = int(requested_step or 0)
+    checkpoint_step = int(checkpoint_step or 0)
+    if requested_step < 0 or checkpoint_step < 0:
+        raise ValueError("Checkpoint steps must be non-negative.")
+    if requested_step and checkpoint_step and requested_step != checkpoint_step:
+        raise ValueError(
+            f"Requested step {requested_step} conflicts with checkpoint-recorded step "
+            f"{checkpoint_step}: {checkpoint_path}"
+        )
+    return requested_step or checkpoint_step
+
+
+def audit_image_paths(paths, data_class, split):
+    """Strictly decode images and return structured failure records."""
+
+    invalid = []
+    for index, path in enumerate(paths):
+        try:
+            with Image.open(path) as image:
+                image.convert("RGB").load()
+        except (OSError, ValueError) as error:
+            invalid.append(
+                {
+                    "data_class": data_class,
+                    "split": split,
+                    "dataset_index": index,
+                    "filepath": path,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+    return invalid
+
+
 def git_commit():
     try:
         return subprocess.check_output(
@@ -151,41 +175,6 @@ def git_commit():
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
-
-
-def sampling_manifest_rows(exclude_class, seed, shot, sampling):
-    rows = []
-    for data_class in ("real", exclude_class):
-        selected = sampling[data_class]
-        for rank, index in enumerate(selected["support_indices"], 1):
-            rows.append(
-                {
-                    "exclude_class": exclude_class,
-                    "seed": seed,
-                    "shot": shot,
-                    "data_class": data_class,
-                    "split": "val",
-                    "dataset_index": index,
-                    "filepath": selected["paths"][index],
-                    "role": "support",
-                    "support_rank": rank,
-                }
-            )
-        for index in selected["query_indices"]:
-            rows.append(
-                {
-                    "exclude_class": exclude_class,
-                    "seed": seed,
-                    "shot": shot,
-                    "data_class": data_class,
-                    "split": "val",
-                    "dataset_index": index,
-                    "filepath": selected["paths"][index],
-                    "role": "query",
-                    "support_rank": "",
-                }
-            )
-    return rows
 
 
 def audit_formal_val_images(data_root, exclude_class, output_dir):
@@ -230,7 +219,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = load_checkpoint(args.ckpt_path)
     model_mode = resolve_model_mode(args.model_mode, checkpoint)
-    branch_mode = args.branch_mode or model_mode
+    branch_mode = args.branch_mode
     if model_mode != "dual" and branch_mode != model_mode:
         raise ValueError(
             f"A {model_mode} checkpoint can only be evaluated with --branch_mode {model_mode}; "
@@ -276,11 +265,7 @@ def main():
         raise ValueError("test_ddfsd.py main-protocol evaluation requires num_support_test > 0.")
     if args.max_eval_query_per_class < 0:
         raise ValueError("max_eval_query_per_class must be non-negative.")
-    if args.zero_shot_metadata_per_class <= 0:
-        raise ValueError("zero_shot_metadata_per_class must be positive.")
-
     per_seed_rows = []
-    manifest_rows = []
     for seed in seeds:
         metrics = evaluate_binary_few_shot(
             model=model,
@@ -297,7 +282,7 @@ def main():
             max_query_per_class=args.max_eval_query_per_class,
             model_mode=model_mode,
             branch_mode=branch_mode,
-            return_indices=args.save_manifest,
+            return_indices=False,
             strict_images=True,
         )
         row = {
@@ -326,15 +311,6 @@ def main():
             "ckpt_path": args.ckpt_path,
         }
         per_seed_rows.append(row)
-        if args.save_manifest:
-            manifest_rows.extend(
-                sampling_manifest_rows(
-                    args.exclude_class,
-                    seed,
-                    args.num_support_test,
-                    metrics["sampling"],
-                )
-            )
         logger.info(
             "DDFSD eval checkpoint_model_mode=%s branch_mode=%s seed=%d: "
             "ACC %.6f Real ACC %.6f Fake ACC %.6f Balanced ACC %.6f AP %.6f AUC %.6f",
@@ -459,27 +435,6 @@ def main():
             "ckpt_path",
         ],
     )
-    if args.save_manifest:
-        manifest_path = args.manifest_path or os.path.join(
-            args.output_dir, "support_query_manifest.csv"
-        )
-        write_csv(
-            manifest_path,
-            manifest_rows,
-            [
-                "exclude_class",
-                "seed",
-                "shot",
-                "data_class",
-                "split",
-                "dataset_index",
-                "filepath",
-                "role",
-                "support_rank",
-            ],
-        )
-        logger.info("Saved support/query manifest: %s", manifest_path)
-
     config = {
         "protocol": FORMAL_PROTOCOL,
         "git_commit": git_commit(),
@@ -500,13 +455,6 @@ def main():
         "tau": args.tau,
         "tau_r": args.tau_r,
         "max_eval_query_per_class": args.max_eval_query_per_class,
-        "zero_shot_metadata_per_class": args.zero_shot_metadata_per_class,
-        "save_manifest": args.save_manifest,
-        "manifest_path": (
-            os.path.abspath(args.manifest_path or os.path.join(args.output_dir, "support_query_manifest.csv"))
-            if args.save_manifest
-            else ""
-        ),
         "strict_formal_eval_images": True,
         "formal_val_invalid_images_path": os.path.abspath(val_audit_path),
     }

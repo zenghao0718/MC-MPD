@@ -1,9 +1,7 @@
 torch>=2.3.0
 torchvision
-torchmetrics
 timm
-einops
-dill
-tqdm
+numpy
+Pillow
 scikit-learn
-matplotlib
+tensorboard
