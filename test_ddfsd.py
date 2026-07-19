@@ -245,9 +245,11 @@ def main():
         model_mode, branch_mode, args.ckpt_path, args.output_dir,
     )
     model = DDFSDDualDomainNet(pretrained=args.pretrained, model_mode=model_mode)
+    # Load checkpoint buffers first, then explicitly apply the frequency
+    # statistics selected for this evaluation.
+    model.load_state_dict(checkpoint["model"])
     if stats is not None:
         model.set_freq_stats(stats["mean"], stats["std"])
-    model.load_state_dict(checkpoint["model"])
     model = model.to(device)
     model.eval()
 
