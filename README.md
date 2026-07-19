@@ -92,9 +92,29 @@ GenImage is not included in this repository. The repository also does not curren
 
 ---
 
-## Baseline Method
+## Compared Methods
 
-DDFSD builds on the episodic prototypical-learning paradigm introduced by **FSD: Few-Shot Learner Generalizes Across AI-Generated Image Detection** and extends it with dual-domain prototype learning, support-dependent distance fusion, and an asymmetric prototype-margin objective.
+The accompanying study compares DDFSD with eight representative AI-generated image detection methods covering different forensic domains and learning paradigms.
+
+### Spatial-domain detectors
+
+- **CNNSpot** learns transferable generation artifacts directly from RGB images using a convolutional classifier and generalization-oriented augmentation strategies.
+- **NPR** models neighboring-pixel relationships to expose local structural traces introduced by upsampling operations in generative networks.
+
+### Frequency-aware detector
+
+- **FreqNet** performs frequency-aware modeling at both the image and intermediate-feature levels, explicitly exploiting frequency-domain cues including amplitude- and phase-related evidence.
+
+### Spatial-frequency and foundation-model-based detectors
+
+- **FatFormer** combines local spatial forgery traces with wavelet-frequency evidence in a pretrained vision-language framework.
+- **UnivFD** uses frozen CLIP representations with a lightweight classifier to reduce overfitting to artifacts from specific generators.
+- **VIB-Net** uses a variational information bottleneck to retain authenticity-relevant evidence while suppressing semantic information unrelated to the detection task.
+
+### Few-shot detectors
+
+- **FSD** learns a prototypical metric space in a single RGB domain through episodic training. It builds prototypes from a small support set for the target generator and performs inference without test-time gradient updates. DDFSD extends this paradigm with dual-domain prototypes, support-set reliability estimation, and an asymmetric prototype-margin constraint.
+- **LIDA** extracts generation fingerprints from low bit planes and combines few-shot adaptation with similarity retrieval and detection.
 
 ---
 
@@ -159,9 +179,38 @@ If the default PyTorch package does not match your CUDA runtime, install the app
 
 Pretrained checkpoints can be downloaded from:
 
-- [Baidu Netdisk](https://pan.baidu.com/s/1fXonbCSiWqMYksSyCAoN0A?pwd=vwq6)
+- [Baidu Netdisk](https://pan.baidu.com/s/1YmL59_hJIIguExwbGzEbQA?pwd=vuuy)
 
-Checkpoints are organized by the target class in the leave-one-generator-out protocol. Formal evaluation also requires the `freq_stats.pt` file produced by the matching training task. Follow the actual layout in the downloaded package when setting `CKPT_PATH` and `FREQ_STATS_PATH`.
+After extracting the downloaded ZIP archive, the package has the following structure:
+
+```text
+DDFSD_pretrained/
+|-- exclude_ADM/
+|   |-- ddfsd_step[15000].pth
+|   `-- freq_stats.pt
+|-- exclude_BigGAN/
+|   |-- ddfsd_step[15000].pth
+|   `-- freq_stats.pt
+|-- exclude_glide/
+|   |-- ddfsd_step[15000].pth
+|   `-- freq_stats.pt
+|-- exclude_Midjourney/
+|   |-- ddfsd_step[15000].pth
+|   `-- freq_stats.pt
+|-- exclude_SD/
+|   |-- ddfsd_step[15000].pth
+|   `-- freq_stats.pt
+|-- exclude_VQDM/
+|   |-- ddfsd_step[15000].pth
+|   `-- freq_stats.pt
+|-- MANIFEST.csv
+|-- SHA256SUMS.txt
+`-- README.txt
+```
+
+Each `exclude_<CLASS>` directory represents one leave-one-generator-out task. Its `ddfsd_step[15000].pth` file is the main-experiment checkpoint, and its `freq_stats.pt` file contains the frequency-domain mean and standard deviation computed from that task's training split. These two files must always be used as a matched pair from the same directory; never combine a checkpoint from one held-out class with frequency statistics from another. Formal evaluation must not recompute frequency statistics from validation or test data.
+
+`MANIFEST.csv` records artifact provenance and verification information, `SHA256SUMS.txt` provides integrity checksums, and `README.txt` contains concise instructions for using the package.
 
 ---
 
@@ -202,6 +251,19 @@ bash scripts/eval_main.sh
 By default, evaluation loads the step-15000 checkpoint and its matching `freq_stats.pt`. It performs 10-shot evaluation with seeds `42, 101, 102, 103, 104`, uses the complete remaining validation set as queries, and reports ACC, AP, and AUC. The published main protocol uses both branches with support-dependent adaptive fusion.
 
 Set `RUN_ROOT`, `RUN_DIR`, `CKPT_PATH`, `FREQ_STATS_PATH`, or `OUTPUT_DIR` explicitly when the files are stored outside the default run layout.
+
+#### Evaluate with Downloaded Checkpoints
+
+```bash
+DATA_ROOT=/path/to/GenImage \
+EXCLUDE_CLASS=ADM \
+CKPT_PATH='/path/to/DDFSD_pretrained/exclude_ADM/ddfsd_step[15000].pth' \
+FREQ_STATS_PATH='/path/to/DDFSD_pretrained/exclude_ADM/freq_stats.pt' \
+OUTPUT_DIR='/path/to/results/exclude_ADM' \
+bash scripts/eval_main.sh
+```
+
+Replace `ADM` with the desired held-out generator and use the checkpoint and frequency statistics from the same `exclude_<CLASS>` directory. The quoted checkpoint path is required because the filename contains square brackets.
 
 ### 3. Run All Six Leave-One-Out Tasks
 
