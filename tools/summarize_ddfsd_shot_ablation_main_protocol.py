@@ -17,6 +17,7 @@ from util.ddfsd_main_protocol import FAKE_CLASSES, FORMAL_SEEDS, FORMAL_SHOTS
 from util.ddfsd_main_protocol_validation import (
     load_result_configs,
     normalize_path,
+    resolve_reference_csv,
     validate_aggregate_configs,
 )
 
@@ -48,6 +49,42 @@ def parse_int_list(value: str) -> List[int]:
 
 def render(template: str, **values) -> str:
     return os.path.abspath(template.format(**values))
+
+
+def resolve_class_reference_csvs(
+    reference_main_root,
+    classes,
+    ckpt_step,
+    explicit_template=None,
+    common_template=(
+        "{reference_main_root}/exclude_{class_name}/formal_eval/"
+        "ddfsd_eval_per_seed.csv"
+    ),
+    step_template=(
+        "{reference_main_root}/exclude_{class_name}/formal_eval/step_{step}/"
+        "ddfsd_eval_per_seed.csv"
+    ),
+):
+    resolved = {}
+    values = {"reference_main_root": os.path.abspath(reference_main_root)}
+    for class_name in classes:
+        render_values = {
+            **values,
+            "class_name": class_name,
+            "class": class_name,
+            "step": ckpt_step,
+        }
+        explicit_path = (
+            render(explicit_template, **render_values)
+            if explicit_template is not None
+            else None
+        )
+        candidates = [
+            render(common_template, **render_values),
+            render(step_template, **render_values),
+        ]
+        resolved[class_name] = resolve_reference_csv(explicit_path, candidates)
+    return resolved
 
 
 def _result_csv(result_dir: str, shot: int) -> str:
@@ -156,7 +193,21 @@ def parse_args():
     )
     parser.add_argument(
         "--reference_csv_template",
-        default="{reference_main_root}/exclude_{class_name}/formal_eval/step_{step}/ddfsd_eval_per_seed.csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--reference_common_csv_template",
+        default=(
+            "{reference_main_root}/exclude_{class_name}/formal_eval/"
+            "ddfsd_eval_per_seed.csv"
+        ),
+    )
+    parser.add_argument(
+        "--reference_step_csv_template",
+        default=(
+            "{reference_main_root}/exclude_{class_name}/formal_eval/step_{step}/"
+            "ddfsd_eval_per_seed.csv"
+        ),
     )
     parser.add_argument("--parity_tolerance", type=float, default=1e-6)
     return parser.parse_args()
@@ -209,21 +260,22 @@ def main():
         configs_by_key=configs_by_key,
     )
 
+    try:
+        references_by_class = resolve_class_reference_csvs(
+            args.reference_main_root,
+            classes,
+            args.ckpt_step,
+            explicit_template=args.reference_csv_template,
+            common_template=args.reference_common_csv_template,
+            step_template=args.reference_step_csv_template,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"Reference CSV resolution failed: {exc}") from exc
+
     parity_rows = []
     parity_errors = []
     for class_name in classes:
-        reference_path = render(
-            args.reference_csv_template,
-            reference_main_root=os.path.abspath(args.reference_main_root),
-            class_name=class_name,
-            **{"class": class_name},
-            step=args.ckpt_step,
-        )
-        if not os.path.isfile(reference_path):
-            parity_errors.append(
-                f"Missing reference main CSV for {class_name}: {reference_path}"
-            )
-            continue
+        reference_path = references_by_class[class_name]
         rows, errors = compare_parity_rows(
             by_class_shot[(class_name, 10)],
             read_csv(reference_path),

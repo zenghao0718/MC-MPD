@@ -8,6 +8,9 @@ import unittest
 
 from util.ddfsd_main_protocol import FAKE_CLASSES, FORMAL_SHOTS
 from util.ddfsd_main_protocol_validation import FORMAL_PROTOCOL, config_filename
+from tools.summarize_ddfsd_shot_ablation_main_protocol import (
+    resolve_class_reference_csvs,
+)
 
 
 FIELDS = [
@@ -223,6 +226,60 @@ class ShotSummaryGateTest(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("configuration validation failed", completed.stderr.lower())
             self.assertFalse(os.path.exists(output_dir))
+
+
+class SummaryReferenceResolutionTest(unittest.TestCase):
+    def test_six_classes_can_use_mixed_common_and_step_layouts(self):
+        with tempfile.TemporaryDirectory() as root:
+            expected = {}
+            for index, class_name in enumerate(FAKE_CLASSES):
+                suffix = (
+                    os.path.join("formal_eval", "ddfsd_eval_per_seed.csv")
+                    if index % 2 == 0
+                    else os.path.join(
+                        "formal_eval", "step_15000", "ddfsd_eval_per_seed.csv"
+                    )
+                )
+                path = os.path.join(root, f"exclude_{class_name}", suffix)
+                write_rows(path, [fixture_row(root, class_name, 10)])
+                expected[class_name] = os.path.normcase(os.path.realpath(path))
+            self.assertEqual(
+                resolve_class_reference_csvs(root, FAKE_CLASSES, 15000), expected
+            )
+
+    def test_explicit_template_is_the_only_reference_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            explicit_template = os.path.join(
+                root, "explicit", "exclude_{class_name}", "reference.csv"
+            )
+            expected = {}
+            for class_name in FAKE_CLASSES:
+                explicit = explicit_template.format(class_name=class_name)
+                common = os.path.join(
+                    root,
+                    f"exclude_{class_name}",
+                    "formal_eval",
+                    "ddfsd_eval_per_seed.csv",
+                )
+                step = os.path.join(
+                    root,
+                    f"exclude_{class_name}",
+                    "formal_eval",
+                    "step_15000",
+                    "ddfsd_eval_per_seed.csv",
+                )
+                for path in (explicit, common, step):
+                    write_rows(path, [fixture_row(root, class_name, 10)])
+                expected[class_name] = os.path.normcase(os.path.realpath(explicit))
+            self.assertEqual(
+                resolve_class_reference_csvs(
+                    root,
+                    FAKE_CLASSES,
+                    15000,
+                    explicit_template=explicit_template,
+                ),
+                expected,
+            )
 
 
 if __name__ == "__main__":

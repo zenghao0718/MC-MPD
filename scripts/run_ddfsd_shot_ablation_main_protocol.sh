@@ -2,6 +2,10 @@
 # Formal main-protocol shot ablation. Run this long evaluation inside screen on AutoDL.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 ALL_CLASSES="ADM BigGAN glide Midjourney SD VQDM"
 CLASSES=${CLASSES:-"${ALL_CLASSES}"}
 SHOTS=${SHOTS:-"0 5 10 20 30 50"}
@@ -28,12 +32,20 @@ GIT_COMMIT=${GIT_COMMIT:-"$(git rev-parse HEAD)"}
 CKPT_PATH_TEMPLATE=${CKPT_PATH_TEMPLATE:-"${CKPT_ROOT}/exclude_{class}/ckpt/ddfsd_step[{step}].pth"}
 FREQ_STATS_PATH_TEMPLATE=${FREQ_STATS_PATH_TEMPLATE:-"${FREQ_STATS_ROOT}/exclude_{class}/freq_stats.pt"}
 SHOT_OUTPUT_TEMPLATE=${SHOT_OUTPUT_TEMPLATE:-"${OUTPUT_ROOT}/exclude_{class}/shot_{shot}"}
-REFERENCE_CSV_TEMPLATE=${REFERENCE_CSV_TEMPLATE:-"${REFERENCE_MAIN_ROOT}/exclude_{class}/formal_eval/step_{step}/ddfsd_eval_per_seed.csv"}
+if [[ -n "${REFERENCE_CSV_TEMPLATE+x}" ]]; then
+  REFERENCE_TEMPLATE_ARGS=(--reference_csv_template "${REFERENCE_CSV_TEMPLATE}")
+else
+  REFERENCE_TEMPLATE_ARGS=()
+fi
 
 case "${AGGREGATE}" in auto|0|1) ;; *) echo "AGGREGATE must be auto, 0, or 1." >&2; exit 1 ;; esac
 case "${SKIP_COMPLETED}" in 0|1) ;; *) echo "SKIP_COMPLETED must be 0 or 1." >&2; exit 1 ;; esac
 [[ "${MAX_EVAL_QUERY_PER_CLASS}" == "0" ]] || {
   echo "Formal main-protocol evaluation requires MAX_EVAL_QUERY_PER_CLASS=0." >&2
+  exit 1
+}
+[[ "${ZERO_SHOT_METADATA_PER_CLASS}" == "1024" ]] || {
+  echo "Formal zero-shot evaluation requires ZERO_SHOT_METADATA_PER_CLASS=1024." >&2
   exit 1
 }
 
@@ -176,7 +188,7 @@ if [[ "${should_aggregate}" == "1" ]]; then
     --input_root "${OUTPUT_ROOT}" \
     --output_dir "${OUTPUT_ROOT}/summary" \
     --reference_main_root "${REFERENCE_MAIN_ROOT}" \
-    --reference_csv_template "${REFERENCE_CSV_TEMPLATE}" \
+    "${REFERENCE_TEMPLATE_ARGS[@]}" \
     --ckpt_step "${CKPT_STEP}" \
     --eval_seeds "${EVAL_SEEDS}"
 else
