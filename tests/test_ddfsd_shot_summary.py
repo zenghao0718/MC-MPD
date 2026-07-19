@@ -83,7 +83,7 @@ def fixture_row(root, class_name, shot):
 
 def fixture_config(root, class_name, shot):
     ckpt_path, freq_stats_path = fixture_paths(root, class_name)
-    return {
+    config = {
         "protocol": FORMAL_PROTOCOL,
         "git_commit": "same-commit",
         "exclude_class": class_name,
@@ -102,6 +102,16 @@ def fixture_config(root, class_name, shot):
         "zero_shot_metadata_per_class": 1024,
         "strict_formal_eval_images": True,
     }
+    if shot == 0:
+        config.update(
+            {
+                "held_out_class": class_name,
+                "metadata_samples_per_class": 1024,
+                "metadata_sampling_mode": "deterministic_lazy_strict_until_full",
+                "full_train_audit": False,
+            }
+        )
+    return config
 
 
 def build_fixture_tree(directory, parity_mismatch=False, config_mutation=None):

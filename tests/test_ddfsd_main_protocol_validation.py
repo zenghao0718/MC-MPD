@@ -8,6 +8,7 @@ from util.ddfsd_main_protocol_validation import (
     FORMAL_PROTOCOL,
     config_filename,
     required_result_files,
+    resolve_reference_csv,
     validate_aggregate_configs,
     validate_completed_result,
 )
@@ -17,7 +18,7 @@ CLASSES = ("ADM", "BigGAN", "glide", "Midjourney", "SD", "VQDM")
 
 
 def expected_config(root, class_name="ADM", shot=10):
-    return {
+    config = {
         "protocol": FORMAL_PROTOCOL,
         "git_commit": "abc123",
         "exclude_class": class_name,
@@ -36,6 +37,16 @@ def expected_config(root, class_name="ADM", shot=10):
         "zero_shot_metadata_per_class": 1024,
         "strict_formal_eval_images": True,
     }
+    if shot == 0:
+        config.update(
+            {
+                "held_out_class": class_name,
+                "metadata_samples_per_class": 1024,
+                "metadata_sampling_mode": "deterministic_lazy_strict_until_full",
+                "full_train_audit": False,
+            }
+        )
+    return config
 
 
 def snapshot_tree(root):
@@ -127,6 +138,31 @@ class CompletionValidationTest(unittest.TestCase):
             for field in mutations:
                 self.assertTrue(any(error.startswith(f"{field}:") for error in errors))
 
+    def test_old_full_audit_zero_shot_result_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = os.path.join(root, "exclude_ADM", "shot_0")
+            os.makedirs(output)
+            expected = expected_config(root, shot=0)
+            actual = copy.deepcopy(expected)
+            actual["metadata_sampling_mode"] = "full_train_strict_audit_then_sample"
+            actual["full_train_audit"] = True
+            for filename in required_result_files(0):
+                with open(
+                    os.path.join(output, filename), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write("present\n")
+            with open(
+                os.path.join(output, config_filename(0)), "w", encoding="utf-8"
+            ) as handle:
+                json.dump(actual, handle)
+            errors = validate_completed_result(output, expected)
+            self.assertTrue(
+                any(error.startswith("metadata_sampling_mode:") for error in errors)
+            )
+            self.assertTrue(
+                any(error.startswith("full_train_audit:") for error in errors)
+            )
+
 
 def aggregate_records(root, shots=(0, 5)):
     records = []
@@ -163,6 +199,7 @@ class AggregateConfigurationValidationTest(unittest.TestCase):
             ("git_commit", "different"),
             ("tau_r", 0.2),
             ("protocol", "fixed-query exploratory protocol"),
+            ("metadata_sampling_mode", "full_train_strict_audit_then_sample"),
             ("exclude_class", "BigGAN"),
             ("shot", 30),
         )
@@ -198,6 +235,60 @@ class AggregateConfigurationValidationTest(unittest.TestCase):
                 )
                 self.assertTrue(any("shared by" in error for error in errors))
                 self.assertTrue(any("exclude_ADM" in error for error in errors))
+
+
+class ReferenceCsvResolutionTest(unittest.TestCase):
+    @staticmethod
+    def _touch(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("seed,shot,ckpt_step\n")
+
+    def test_explicit_reference_has_priority(self):
+        with tempfile.TemporaryDirectory() as root:
+            explicit = os.path.join(root, "explicit.csv")
+            common = os.path.join(root, "formal_eval", "reference.csv")
+            compatibility = os.path.join(
+                root, "formal_eval", "step_15000", "reference.csv"
+            )
+            for path in (explicit, common, compatibility):
+                self._touch(path)
+            self.assertEqual(
+                resolve_reference_csv(explicit, [common, compatibility]),
+                os.path.normcase(os.path.realpath(explicit)),
+            )
+
+    def test_unique_default_candidate_is_selected(self):
+        with tempfile.TemporaryDirectory() as root:
+            common = os.path.join(root, "formal_eval", "reference.csv")
+            compatibility = os.path.join(
+                root, "formal_eval", "step_15000", "reference.csv"
+            )
+            self._touch(common)
+            self.assertEqual(
+                resolve_reference_csv(None, [common, compatibility]),
+                os.path.normcase(os.path.realpath(common)),
+            )
+
+    def test_no_default_candidate_fails_and_lists_candidates(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidates = [
+                os.path.join(root, "common.csv"),
+                os.path.join(root, "step.csv"),
+            ]
+            with self.assertRaisesRegex(FileNotFoundError, "common.csv"):
+                resolve_reference_csv(None, candidates)
+
+    def test_two_default_candidates_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidates = [
+                os.path.join(root, "common.csv"),
+                os.path.join(root, "step.csv"),
+            ]
+            for path in candidates:
+                self._touch(path)
+            with self.assertRaisesRegex(ValueError, "Set REFERENCE_CSV explicitly"):
+                resolve_reference_csv(None, candidates)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,19 @@ GIT_COMMIT=${GIT_COMMIT:-"$(git rev-parse HEAD)"}
 
 CKPT_PATH=${CKPT_PATH:-"${CKPT_ROOT}/exclude_ADM/ckpt/ddfsd_step[${CKPT_STEP}].pth"}
 FREQ_STATS_PATH=${FREQ_STATS_PATH:-"${FREQ_STATS_ROOT}/exclude_ADM/freq_stats.pt"}
-REFERENCE_CSV=${REFERENCE_CSV:-"${REFERENCE_MAIN_ROOT}/exclude_ADM/formal_eval/step_${CKPT_STEP}/ddfsd_eval_per_seed.csv"}
+REFERENCE_COMMON_CSV="${REFERENCE_MAIN_ROOT}/exclude_ADM/formal_eval/ddfsd_eval_per_seed.csv"
+REFERENCE_STEP_CSV="${REFERENCE_MAIN_ROOT}/exclude_ADM/formal_eval/step_${CKPT_STEP}/ddfsd_eval_per_seed.csv"
+if [[ -n "${REFERENCE_CSV+x}" ]]; then
+  REFERENCE_RESOLVE_ARGS=(--explicit "${REFERENCE_CSV}")
+else
+  REFERENCE_RESOLVE_ARGS=(
+    --candidate "${REFERENCE_COMMON_CSV}"
+    --candidate "${REFERENCE_STEP_CSV}"
+  )
+fi
+REFERENCE_CSV="$(
+  "${PYTHON_BIN}" tools/resolve_ddfsd_reference_csv.py "${REFERENCE_RESOLVE_ARGS[@]}"
+)"
 PARITY_CSV=${PARITY_CSV:-"${OUTPUT_DIR}/ddfsd_10shot_parity.csv"}
 
 [[ "${CKPT_STEP}" == "15000" ]] || {

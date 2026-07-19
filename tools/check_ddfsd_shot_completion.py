@@ -12,6 +12,7 @@ from util.ddfsd_main_protocol_validation import (
     FORMAL_PROTOCOL,
     validate_completed_result,
 )
+from util.ddfsd_main_protocol import ZERO_SHOT_METADATA_SAMPLING_MODE
 
 
 def parse_args():
@@ -58,6 +59,15 @@ def main():
         "zero_shot_metadata_per_class": args.zero_shot_metadata_per_class,
         "strict_formal_eval_images": True,
     }
+    if args.shot == 0:
+        expected.update(
+            {
+                "held_out_class": args.exclude_class,
+                "metadata_samples_per_class": args.zero_shot_metadata_per_class,
+                "metadata_sampling_mode": ZERO_SHOT_METADATA_SAMPLING_MODE,
+                "full_train_audit": False,
+            }
+        )
     errors = validate_completed_result(args.output_dir, expected)
     if errors:
         raise SystemExit(

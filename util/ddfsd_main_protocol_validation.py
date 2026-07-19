@@ -42,6 +42,12 @@ CONSISTENT_AGGREGATE_FIELDS = (
     "zero_shot_metadata_per_class",
     "strict_formal_eval_images",
 )
+ZERO_SHOT_COMPLETION_FIELDS = (
+    "held_out_class",
+    "metadata_samples_per_class",
+    "metadata_sampling_mode",
+    "full_train_audit",
+)
 
 
 def normalize_path(value: object) -> str:
@@ -49,6 +55,36 @@ def normalize_path(value: object) -> str:
         return ""
     return os.path.normcase(
         os.path.realpath(os.path.abspath(os.path.expanduser(str(value))))
+    )
+
+
+def resolve_reference_csv(explicit_path, candidates: Sequence[str]) -> str:
+    """Resolve an explicit parity CSV or require exactly one default candidate."""
+
+    if explicit_path is not None:
+        resolved = normalize_path(explicit_path)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(
+                f"Explicit REFERENCE_CSV does not exist: {resolved}"
+            )
+        return resolved
+
+    resolved_candidates = []
+    for candidate in candidates:
+        resolved = normalize_path(candidate)
+        if resolved not in resolved_candidates:
+            resolved_candidates.append(resolved)
+    existing = [path for path in resolved_candidates if os.path.isfile(path)]
+    if len(existing) == 1:
+        return existing[0]
+    listed = "\n- ".join(resolved_candidates)
+    if not existing:
+        raise FileNotFoundError(
+            "No default ADM parity reference CSV exists. Checked:\n- " + listed
+        )
+    raise ValueError(
+        "Ambiguous ADM parity reference CSV: multiple default candidates exist. "
+        "Set REFERENCE_CSV explicitly. Existing:\n- " + "\n- ".join(existing)
     )
 
 
@@ -85,6 +121,12 @@ def required_result_files(shot: int) -> List[str]:
     ]
 
 
+def completion_fields(shot: int):
+    if int(shot) == 0:
+        return COMPLETION_FIELDS + ZERO_SHOT_COMPLETION_FIELDS
+    return COMPLETION_FIELDS
+
+
 def _same_value(field: str, actual: object, expected: object) -> bool:
     if field in PATH_FIELDS:
         return normalize_path(actual) == normalize_path(expected)
@@ -100,6 +142,7 @@ def _same_value(field: str, actual: object, expected: object) -> bool:
         "ckpt_step",
         "max_eval_query_per_class",
         "zero_shot_metadata_per_class",
+        "metadata_samples_per_class",
     }:
         try:
             return int(actual) == int(expected)
@@ -114,6 +157,8 @@ def _same_value(field: str, actual: object, expected: object) -> bool:
             return False
     if field == "strict_formal_eval_images":
         return actual is True and expected is True
+    if field == "full_train_audit":
+        return actual is False and expected is False
     return actual == expected
 
 
@@ -166,7 +211,7 @@ def validate_completed_result(
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         errors.append(f"cannot read configuration {config_path}: {exc}")
         return errors
-    errors.extend(compare_config(config, expected))
+    errors.extend(compare_config(config, expected, fields=completion_fields(shot)))
     return errors
 
 
@@ -235,6 +280,7 @@ def validate_aggregate_configs(
         )
 
     common_values: Dict[str, object] = {}
+    zero_shot_values: Dict[str, object] = {}
     resources: Dict[str, Dict[str, set]] = {
         name: {"ckpt_path": set(), "freq_stats_path": set()} for name in classes
     }
@@ -263,6 +309,19 @@ def validate_aggregate_configs(
             "max_eval_query_per_class": 0,
             "strict_formal_eval_images": True,
         }
+        if shot == 0:
+            expected.update(
+                {
+                    "held_out_class": class_name,
+                    "metadata_samples_per_class": config.get(
+                        "zero_shot_metadata_per_class"
+                    ),
+                    "metadata_sampling_mode": (
+                        "deterministic_lazy_strict_until_full"
+                    ),
+                    "full_train_audit": False,
+                }
+            )
         errors.extend(
             f"{label}: {error}"
             for error in compare_config(
@@ -290,6 +349,33 @@ def validate_aggregate_configs(
                     f"{label}: {field}={value!r} differs from {common_values[field]!r}"
                 )
 
+        if shot == 0:
+            if not _same_value(
+                "metadata_samples_per_class",
+                config.get("metadata_samples_per_class"),
+                config.get("zero_shot_metadata_per_class"),
+            ):
+                errors.append(
+                    f"{label}: metadata_samples_per_class must equal "
+                    "zero_shot_metadata_per_class"
+                )
+            for field in (
+                "metadata_samples_per_class",
+                "metadata_sampling_mode",
+                "full_train_audit",
+            ):
+                if field not in config:
+                    errors.append(f"{label}: missing {field}")
+                    continue
+                value = config[field]
+                if field not in zero_shot_values:
+                    zero_shot_values[field] = value
+                elif not _same_value(field, value, zero_shot_values[field]):
+                    errors.append(
+                        f"{label}: {field}={value!r} differs from "
+                        f"{zero_shot_values[field]!r}"
+                    )
+
         if class_name not in resources:
             continue
         for field in ("ckpt_path", "freq_stats_path"):
@@ -316,6 +402,23 @@ def validate_aggregate_configs(
         errors.append("zero_shot_metadata_per_class must be an integer")
     if not common_values.get("git_commit"):
         errors.append("git_commit must be non-empty and consistent")
+    if zero_shot_values:
+        if zero_shot_values.get("metadata_sampling_mode") != (
+            "deterministic_lazy_strict_until_full"
+        ):
+            errors.append(
+                "metadata_sampling_mode must be "
+                "deterministic_lazy_strict_until_full for zero-shot aggregation"
+            )
+        if zero_shot_values.get("full_train_audit") is not False:
+            errors.append("full_train_audit must be false for zero-shot aggregation")
+        try:
+            if int(zero_shot_values.get("metadata_samples_per_class", 0)) != 1024:
+                errors.append(
+                    "metadata_samples_per_class must be 1024 for formal zero-shot aggregation"
+                )
+        except (TypeError, ValueError):
+            errors.append("metadata_samples_per_class must be an integer")
 
     for field in ("ckpt_path", "freq_stats_path"):
         owner_by_path = {}

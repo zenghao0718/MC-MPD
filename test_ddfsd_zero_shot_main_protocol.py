@@ -18,10 +18,12 @@ from test_ddfsd import (
     write_csv,
 )
 from util.ddfsd_main_protocol import (
+    InsufficientValidMetadataImages,
+    ZERO_SHOT_METADATA_SAMPLING_MODE,
     audit_image_paths,
-    build_valid_image_indices,
     build_zero_shot_query_indices,
-    sample_metadata_from_valid_indices,
+    sample_metadata_paths_lazy_strict,
+    zero_shot_metadata_manifest_rows,
     zero_shot_metadata_classes,
 )
 from util.ddfsd_main_protocol_validation import FORMAL_PROTOCOL
@@ -189,43 +191,76 @@ def main():
     metadata_caches = {}
     metadata_manifest_rows = []
     invalid_rows = []
+    metadata_visited_counts = {}
     invalid_fields = [
+        "held_out_class",
         "exclude_class",
         "metadata_class",
+        "seed",
         "split",
         "dataset_index",
+        "image_path",
         "filepath",
         "error_type",
+        "error_message",
         "error",
     ]
     for name in metadata_names:
         dataset = load_ddfsd_class_dataset(
             args.data_root, name, "train", strict_images=True
         )
-        class_invalid = []
-        valid_indices = build_valid_image_indices(dataset.paths, class_invalid)
-        for record in class_invalid:
-            invalid_rows.append(
-                {
-                    "exclude_class": args.exclude_class,
-                    "metadata_class": name,
-                    "split": "train",
-                    **record,
-                }
+        per_seed = {}
+        for seed in seeds:
+            try:
+                selected, class_invalid, visited_count = (
+                    sample_metadata_paths_lazy_strict(
+                        paths=dataset.paths,
+                        count=args.zero_shot_metadata_per_class,
+                        data_root=args.data_root,
+                        held_out_class=args.exclude_class,
+                        metadata_class=name,
+                        seed=seed,
+                    )
+                )
+            except InsufficientValidMetadataImages as exc:
+                class_invalid = exc.invalid_records
+                visited_count = exc.visited_count
+                selected = None
+                sampling_error = exc
+            else:
+                sampling_error = None
+
+            for record in class_invalid:
+                invalid_rows.append(
+                    {
+                        "held_out_class": args.exclude_class,
+                        "exclude_class": args.exclude_class,
+                        "metadata_class": name,
+                        "seed": seed,
+                        "split": "train",
+                        "dataset_index": record["dataset_index"],
+                        "image_path": record["filepath"],
+                        "filepath": record["filepath"],
+                        "error_type": record["error_type"],
+                        "error_message": record["error"],
+                        "error": record["error"],
+                    }
+                )
+            metadata_visited_counts[f"{name}:{seed}"] = visited_count
+            # Persist only visited invalid paths, including failure diagnostics.
+            write_csv(
+                os.path.join(args.output_dir, "zero_shot_invalid_images.csv"),
+                invalid_rows,
+                invalid_fields,
             )
-        # Persist the audit incrementally so an insufficient-valid-images error
-        # still leaves the paths that caused it available for diagnosis.
-        write_csv(
-            os.path.join(args.output_dir, "zero_shot_invalid_images.csv"),
-            invalid_rows,
-            invalid_fields,
-        )
-        per_seed = {
-            seed: sample_metadata_from_valid_indices(
-                valid_indices, args.zero_shot_metadata_per_class, seed
-            )
-            for seed in seeds
-        }
+            if sampling_error is not None:
+                raise RuntimeError(
+                    f"Zero-shot metadata sampling failed for class={name}, "
+                    f"seed={seed}: {sampling_error} Invalid-image audit was "
+                    "saved; no evaluation was run."
+                ) from sampling_error
+            per_seed[seed] = selected
+
         union = sorted({index for selected in per_seed.values() for index in selected})
         metadata_datasets[name] = dataset
         metadata_indices[name] = per_seed
@@ -248,18 +283,15 @@ def main():
         for name in metadata_names:
             selected = metadata_indices[name][seed]
             selections[name] = [metadata_positions[name][index] for index in selected]
-            for rank, index in enumerate(selected, 1):
-                metadata_manifest_rows.append(
-                    {
-                        "exclude_class": args.exclude_class,
-                        "seed": seed,
-                        "metadata_class": name,
-                        "split": "train",
-                        "dataset_index": index,
-                        "filepath": metadata_datasets[name].paths[index],
-                        "metadata_rank": rank,
-                    }
+            metadata_manifest_rows.extend(
+                zero_shot_metadata_manifest_rows(
+                    paths=metadata_datasets[name].paths,
+                    selected_indices=selected,
+                    held_out_class=args.exclude_class,
+                    metadata_class=name,
+                    seed=seed,
                 )
+            )
 
         metrics = evaluate_zero_shot_embeddings(
             real_cache,
@@ -407,11 +439,14 @@ def main():
         os.path.join(args.output_dir, "zero_shot_metadata_manifest.csv"),
         metadata_manifest_rows,
         [
+            "held_out_class",
             "exclude_class",
             "seed",
             "metadata_class",
+            "sample_rank",
             "split",
             "dataset_index",
+            "image_path",
             "filepath",
             "metadata_rank",
         ],
@@ -428,10 +463,18 @@ def main():
         "command": sys.argv,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "exclude_class": args.exclude_class,
+        "held_out_class": args.exclude_class,
         "shot": 0,
+        "shots": [0],
         "seeds": seeds,
         "metadata_classes": metadata_names,
         "zero_shot_metadata_per_class": args.zero_shot_metadata_per_class,
+        "metadata_samples_per_class": args.zero_shot_metadata_per_class,
+        "metadata_sampling_mode": ZERO_SHOT_METADATA_SAMPLING_MODE,
+        "full_train_audit": False,
+        "invalid_count": len(invalid_rows),
+        "metadata_invalid_count": len(invalid_rows),
+        "metadata_visited_counts": metadata_visited_counts,
         "data_root": os.path.abspath(args.data_root),
         "ckpt_path": os.path.abspath(args.ckpt_path),
         "ckpt_step": ckpt_step,

@@ -2,14 +2,18 @@ import inspect
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from test_ddfsd import sampling_manifest_rows
 from util.ddfsd_main_protocol import (
+    InsufficientValidMetadataImages,
     audit_image_paths,
     build_valid_image_indices,
     build_zero_shot_query_indices,
+    sample_metadata_paths_lazy_strict,
     sample_metadata_from_valid_indices,
     zero_shot_metadata_classes,
+    zero_shot_metadata_manifest_rows,
 )
 
 try:
@@ -155,6 +159,108 @@ class MetadataValidityTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "only 4 valid images"):
                 sample_metadata_from_valid_indices(valid, 5, seed=42)
+
+    def test_lazy_sampling_stops_as_soon_as_requested_count_is_full(self):
+        paths = [f"image_{index:04d}.png" for index in range(1100)]
+        decoded = []
+        selected, invalid, visited = sample_metadata_paths_lazy_strict(
+            paths, 1024, "/data", "ADM", "real", 42, decoded.append
+        )
+        self.assertEqual(len(selected), 1024)
+        self.assertEqual(len(set(selected)), 1024)
+        self.assertEqual(len(decoded), 1024)
+        self.assertEqual(visited, 1024)
+        self.assertEqual(invalid, [])
+        rows = zero_shot_metadata_manifest_rows(
+            paths, selected, "ADM", "real", 42
+        )
+        self.assertEqual(len(rows), 1024)
+        self.assertEqual([row["sample_rank"] for row in rows], list(range(1, 1025)))
+        self.assertEqual(
+            [row["image_path"] for row in rows], [paths[index] for index in selected]
+        )
+
+    def test_lazy_sampling_records_bad_candidate_and_continues(self):
+        paths = [f"image_{index}.png" for index in range(8)]
+        first = []
+        sample_metadata_paths_lazy_strict(
+            paths, 1, "/data", "ADM", "real", 42, first.append
+        )
+        bad_path = first[0]
+
+        def decode(path):
+            if path == bad_path:
+                raise OSError("corrupt fixture")
+
+        selected, invalid, visited = sample_metadata_paths_lazy_strict(
+            paths, 2, "/data", "ADM", "real", 42, decode
+        )
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(visited, 3)
+        self.assertEqual([row["filepath"] for row in invalid], [bad_path])
+        self.assertEqual(invalid[0]["error_type"], "OSError")
+
+    def test_lazy_sampling_is_reproducible_and_seed_independent(self):
+        paths = [f"image_{index:03d}.png" for index in range(30)]
+        arguments = (paths, 8, "/data", "ADM", "real")
+        first = sample_metadata_paths_lazy_strict(*arguments, 42, lambda path: None)
+        repeated = sample_metadata_paths_lazy_strict(
+            *arguments, 42, lambda path: None
+        )
+        different = sample_metadata_paths_lazy_strict(
+            *arguments, 101, lambda path: None
+        )
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first[0], different[0])
+
+    def test_lazy_sampling_fails_after_exhausting_insufficient_valid_images(self):
+        paths = ["valid.png", "broken.png"]
+
+        def decode(path):
+            if path == "broken.png":
+                raise ValueError("bad image")
+
+        with self.assertRaises(InsufficientValidMetadataImages) as raised:
+            sample_metadata_paths_lazy_strict(
+                paths, 2, "/data", "ADM", "real", 42, decode
+            )
+        self.assertEqual(raised.exception.visited_count, 2)
+        self.assertEqual(
+            [row["filepath"] for row in raised.exception.invalid_records],
+            ["broken.png"],
+        )
+
+    def test_lazy_sampling_does_not_depend_on_builtin_hash(self):
+        with mock.patch("builtins.hash", side_effect=AssertionError("unstable hash")):
+            selected, _, _ = sample_metadata_paths_lazy_strict(
+                ["a.png", "b.png"],
+                1,
+                "/data",
+                "ADM",
+                "real",
+                42,
+                lambda path: None,
+            )
+        self.assertEqual(len(selected), 1)
+
+    def test_lazy_manifest_candidates_are_strictly_decodable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index in range(6):
+                path = os.path.join(directory, f"valid_{index}.png")
+                Image.new("RGB", (4, 4), color=(index, 0, 0)).save(path)
+                paths.append(path)
+            corrupt = os.path.join(directory, "corrupt.png")
+            with open(corrupt, "wb") as handle:
+                handle.write(b"broken")
+            paths.append(corrupt)
+            selected, _, _ = sample_metadata_paths_lazy_strict(
+                paths, 5, directory, "ADM", "real", 42
+            )
+            self.assertEqual(len(selected), 5)
+            for index in selected:
+                with Image.open(paths[index]) as image:
+                    image.convert("RGB").load()
 
 
 @unittest.skipUnless(
